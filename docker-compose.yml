@@ -1,0 +1,60 @@
+
+
+services:
+  app:
+    build: .
+    container_name: xnet-backend
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - /app/node_modules 
+    depends_on:
+      - redis
+      - rabbitmq
+    networks:
+      - backend_network
+  
+  #consumer:
+  #  build: .
+  #  container_name: user-actions-consumer
+  #  command: node dist/userActionsConsumer.js
+  #  depends_on:
+  #    - rabbitmq
+  #  networks:
+  #    - backend_network
+
+  redis:
+    image: redis:latest
+    container_name: redis-server
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend_network
+  
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+    networks:
+      - backend_network
+
+networks:
+  backend_network:
+    driver: bridge
+
+volumes:
+  redis_data:

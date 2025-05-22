@@ -1,0 +1,242 @@
+import 'reflect-metadata';
+
+import express from 'express';
+import radius from 'radius';
+import dgram from 'dgram';
+import swaggerJsDoc from 'swagger-jsdoc';
+import swaggerUi from 'swagger-ui-express';
+import authRoutes from './routes/authRoutes';
+import { initializeDB } from './db/config';
+import radiusRoutes from './routes/radiusRoutes';
+import healthRoutes from './routes/healthRoutes';
+import { errorHandler } from './middleware/errorHandler';
+import { apiLimiter } from './middleware/rateLimiter';
+import { securityMiddleware } from './middleware/security';
+import dotenv from 'dotenv';
+import { loggerMiddleware, requestLogger } from './logging/logging';
+import 'reflect-metadata';
+import profileRoutes from './routes/profileRoutes';
+import sessionRoutes from './routes/sessionRoutes';
+import http from 'http';
+import { startConsumer } from './bus/userActionsConsumer';
+import nasRoutes from './routes/nasRoutes';
+import cron from "node-cron";
+import { generateMonthlyInvoices } from './services/invoiceService';
+import { SessionTrackingWatcher } from './watchers/SessionTrackingWatcher';
+import { WebSocketServer } from 'ws';
+import invoiceRoutes from './routes/invoiceRoutes';
+import './events/invoiceListeners'
+
+dotenv.config();
+
+const app = express();
+
+// Middleware to parse JSON bodies
+app.use(express.json());
+
+
+const port = process.env.PORT || 3000;
+const server = http.createServer(app);
+
+// Create WebSocket server on the same HTTP server
+const wss = new WebSocketServer({ server });
+
+// const io = new SocketIOServer(server, {
+//     cors: {
+//         origin: 'http://localhost:5173',
+//         methods: ['GET', 'POST'],
+//         credentials: true, // optional but helpful
+//     }
+// });
+
+
+
+wss.on('connection', (ws: any) => {
+    console.log('✅ WebSocket client connected');
+
+    // const sendMetrics = () => {
+    //   const metrics = {
+    //     totalOnlineUsers: Math.floor(Math.random() * 50),
+    //     totalActiveUsers: Math.floor(Math.random() * 10),
+    //   };
+    //   ws.send(JSON.stringify(metrics));
+    // };
+
+    // Start the watcher
+    const watcher = new SessionTrackingWatcher(ws);
+
+    // const interval = setInterval(sendMetrics, 5000);
+    if (!watcher.started) {
+        watcher.start();
+        watcher.started = true;
+    }
+
+    ws.on('close', () => {
+        console.log('❌ WebSocket client disconnected');
+        //clearInterval(interval);
+    });
+});
+
+
+// io.on('connection', (socket: any) => {
+//     console.log("Client connected:", socket.id);
+
+//     // Start the watcher the first time someone connects
+//     if (!watcher.started) {
+//         watcher.start();
+//         watcher.started = true;
+//     }
+
+//     socket.on('disconnect', () => {
+//         console.log('User disconnected');
+//     });
+// });
+
+// io.on('connection_error', (err) => {
+//     console.error('❌ Socket.IO connection error:', err.message);
+// });
+
+// io.use((socket, next) => {
+//     try {
+//         console.log('🔐 Handshake headers:', socket.handshake.headers);
+//         next(); // Allow the connection
+//     } catch (err: any) {
+//         console.error('Middleware error:', err);
+//         next(err);
+//     }
+// });
+
+
+// Apply security middlewares
+securityMiddleware(app);
+
+const jwtSecret = process.env.JWT_SECRET || 'your_jwt_secret';
+
+app.set("trust proxy", true);
+
+// Use the requestLogger middleware
+app.use(requestLogger);
+
+// Then, use express-winston middleware to log detailed request/response info
+app.use(loggerMiddleware);
+
+// Apply rate limiting
+app.use('/api/', apiLimiter);
+
+// Use the auth routes
+app.use('/api/auth', authRoutes);
+
+// Use the health check routes
+app.use('/api', healthRoutes);
+
+app.use('/api', nasRoutes);
+
+app.use('/api/radius', radiusRoutes);
+
+app.use('/api', profileRoutes);
+
+app.use('/api', sessionRoutes);
+
+app.use("/api/invoices", invoiceRoutes);
+
+cron.schedule("0 0 1 * *", async () => {
+    console.log("Running monthly invoice generation...");
+    await generateMonthlyInvoices();
+  });
+
+// RADIUS server setup
+const radiusServer = dgram.createSocket('udp4');
+
+// Hardcoded user database
+const users: { [key: string]: string } = {
+    'testuser': 'password123'
+};
+
+//const client = new MongoClient(process.env.MONGO_URI || 'mongodb://localhost:27017');
+
+async function logSession(username: string, action: string): Promise<void> {
+    // try {
+    //     await client.connect();
+    //     const database = client.db('radius');
+    //     const sessions = database.collection('sessions');
+    //     await sessions.insertOne({ username: username, action: action, timestamp: new Date() });
+    // } finally {
+    //     await client.close();
+    // }
+}
+
+radiusServer.on('message', async (msg, rinfo) => {
+    const packet = radius.decode({ packet: msg, secret: process.env.RADIUS_SECRET || 'your_secret' });
+
+    // Check if the packet is from RADIUS
+    if (!packet) {
+        console.log('Non-RADIUS packet received, ignoring.');
+        return;
+    }
+
+    console.log('RADIUS packet received:', packet);
+
+    // Handle Access-Request
+    if (packet.code === 'Access-Request') {
+        const username = packet.attributes['User-Name'];
+        const password = packet.attributes['User-Password'];
+
+        if (users[username] && users[username] === password) {
+            await logSession(username, 'login');
+            console.log('User logged in:', username);
+        } else {
+            console.log('Access-Reject for user:', username);
+        }
+    }
+
+    // Handle Accounting-Request
+    if (packet.code === 'Accounting-Request') {
+        const username = packet.attributes['User-Name'];
+        const action = packet.attributes['Acct-Status-Type'];
+
+        await logSession(username, action);
+        console.log('Accounting action:', action, 'for user:', username);
+    }
+});
+
+//radiusServer.bind(1812);
+
+const swaggerOptions = {
+    swaggerDefinition: {
+        openapi: '3.0.0',
+        info: {
+            title: 'Xnet Backend Radius Pro API',
+            version: '1.0.0',
+            description: 'API documentation for Xnet Backend Radius Pro',
+        },
+        servers: [
+            {
+                url: 'http://localhost:3000',
+            },
+        ],
+    },
+    apis: ['./src/controllers/*.ts'],
+};
+
+const swaggerDocs = swaggerJsDoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocs));
+
+// Basic route
+app.get('/', (req, res) => {
+    res.send('Xnet server is running');
+});
+
+// Error handling middleware
+app.use(errorHandler);
+
+// Start the consumer in the background
+startConsumer().catch((err) => console.error('Consumer error:', err));
+
+// Initialize database before starting server
+initializeDB().then(() => {
+    server.listen(port, () => {
+        console.log(`Server is running on http://localhost:${port}`);
+    });
+});
+
+// export { io }
