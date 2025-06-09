@@ -1,10 +1,11 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn } from "typeorm";
 
+@Index("username_index", ["username"], {})
+@Index("framedipaddress_index", ["framedipaddress"], {})
 @Index("acctsessionid_index", ["acctsessionid"], {})
+@Index("acctuniqueid_index", ["acctuniqueid"], {})
 @Index("acctstarttime_index", ["acctstarttime"], {})
 @Index("acctstoptime_index", ["acctstoptime"], {})
-@Index("acctuniqueid_index", ["acctuniqueid"], {})
-@Index("framedipaddress_index", ["framedipaddress"], {})
 @Index("nasipaddress_index", ["nasipaddress"], {})
 @Index(
   "radacct_active_session_idx",
@@ -16,7 +17,6 @@ import { Column, Entity, Index, PrimaryGeneratedColumn } from "typeorm";
   ["nasipaddress", "acctstarttime", "acctstoptime"],
   {}
 )
-@Index("username_index", ["username"], {})
 @Entity("radacct", { schema: "radius" })
 export class Radacct {
   @PrimaryGeneratedColumn({ type: "bigint", name: "radacctid" })

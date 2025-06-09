@@ -1,7 +1,7 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn } from "typeorm";
 
-@Index("idx_timestamp", ["timestamp"], {})
 @Index("idx_username", ["username"], {})
+@Index("idx_timestamp", ["timestamp"], {})
 @Entity("quota_logs", { schema: "radius" })
 export class QuotaLogs {
   @PrimaryGeneratedColumn({ type: "bigint", name: "id" })

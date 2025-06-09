@@ -12,7 +12,7 @@ invoiceEvents.on('invoice:modification', async (modification) => {
     try {
         // Create log entry
         const log = new ModificationLog();
-        log.invoiceId = modification.invoiceId;
+        log.invoice = await invoiceRepo.findOne({ where: { id: modification.invoiceId } }) as ExternalInvoice;
         log.username = modification.username;
         log.action = modification.action;
         log.timestamp = modification.timestamp;

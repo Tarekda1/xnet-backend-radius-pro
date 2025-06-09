@@ -1,8 +1,7 @@
-
 // src/services/invoice.service.ts
 import { AppDataSource } from '../db/config';
 import { Raduserprofile } from "../db/entities/Raduserprofile";
-import { Invoice } from "../db/entities/Invoice";
+import { Invoices } from "../db/entities/Invoices";
 import { startOfMonth } from "date-fns";
 import { UserDetails } from '../db/entities/UserDetails';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
@@ -10,7 +9,7 @@ import { invoiceEvents } from '../events/invoiceEvents';
 
 export const generateMonthlyInvoices = async () => {
     const userProfileRepo = AppDataSource.getRepository(Raduserprofile);
-    const invoiceRepo = AppDataSource.getRepository(Invoice);
+    const invoiceRepo = AppDataSource.getRepository(Invoices);
     const userDetailsRepo = AppDataSource.getRepository(UserDetails);
 
     const userProfiles = await userProfileRepo.find({
@@ -20,7 +19,7 @@ export const generateMonthlyInvoices = async () => {
         },
     });
 
-    const billingMonth = startOfMonth(new Date());
+    const billingMonth = startOfMonth(new Date()).toISOString();
 
     for (const user of userProfiles) {
         const exists = await invoiceRepo.findOne({
@@ -53,7 +52,7 @@ export const getAllInvoices = async (
     dateFrom?: string,
     dateTo?: string
 ) => {
-    const invoiceRepo = AppDataSource.getRepository(Invoice);
+    const invoiceRepo = AppDataSource.getRepository(Invoices);
 
     const qb = invoiceRepo.createQueryBuilder("invoice")
         .leftJoinAndSelect("invoice.userProfile", "userProfile")
@@ -94,7 +93,7 @@ export const getAllInvoices = async (
 };
 
 export const payInvoice = async (invoiceId: number) => {
-    const invoiceRepo = AppDataSource.getRepository(Invoice);
+    const invoiceRepo = AppDataSource.getRepository(Invoices);
 
     const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
     if (!invoice) {
@@ -124,7 +123,7 @@ export const payExternalInvoice = async (invoiceId: number) => {
 
 
 export const bulkPayInvoices = async (invoiceIds: number[]) => {
-    const invoiceRepo = AppDataSource.getRepository(Invoice);
+    const invoiceRepo = AppDataSource.getRepository(Invoices);
 
     const invoices = await invoiceRepo.findByIds(invoiceIds);
     if (invoices.length === 0) {
@@ -146,7 +145,10 @@ function mergeExternalInvoices(
     incoming: ExternalInvoice[]
 ): ExternalInvoice[] {
     const sourceMap = new Map(source.map(item => [item.id, item]));
-    const billingMonth = startOfMonth(new Date());
+    // Format date as YYYY-MM-DD
+    const today = new Date();
+    const billingMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
+
     return incoming.map(item => {
         const sourceItem = sourceMap.get(item.id);
 
@@ -173,24 +175,50 @@ function mergeExternalInvoices(
 // 2. Update ExternalInvoice Table
 export const replaceExternalInvoices = async (incoming: ExternalInvoice[]) => {
     const repo = AppDataSource.getRepository(ExternalInvoice);
+    const queryRunner = AppDataSource.createQueryRunner();
 
-    console.log(`incoming: ${incoming}`); // log the incoming data
+    try {
+        // Start transaction
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
 
-    // Fetch current records from the database
-    const current = await repo.find();
+        console.log(`incoming: ${incoming}`); // log the incoming data
 
-    // Merge with incoming
-    const merged = mergeExternalInvoices(current, incoming);
+        // Fetch current records from the database
+        const current = await repo.find();
 
-    console.log(`merged  ${merged}`); // log the result
+        // Merge with incoming
+        const merged = mergeExternalInvoices(current, incoming);
 
-    // Truncate the table
-    await repo.clear(); // equivalent to TRUNCATE, resets auto-increment too
+        console.log(`merged  ${merged}`); // log the result
 
-    // Insert new merged records
-    await repo.save(merged);
+        try {
+            // Delete all records using DELETE instead of TRUNCATE
+            await queryRunner.manager
+                .createQueryBuilder()
+                .delete()
+                .from(ExternalInvoice)
+                .execute();
 
-    return merged;
+            // Insert new merged records
+            await queryRunner.manager.save(ExternalInvoice, merged);
+
+            // Commit transaction
+            await queryRunner.commitTransaction();
+        } catch (err) {
+            // Rollback transaction on error
+            await queryRunner.rollbackTransaction();
+            throw err;
+        }
+
+        return merged;
+    } catch (error) {
+        console.error('Error in replaceExternalInvoices:', error);
+        throw error;
+    } finally {
+        // Release query runner
+        await queryRunner.release();
+    }
 };
 
 export const getAllExternalInvoices = async (
@@ -248,6 +276,11 @@ export const getAllExternalInvoices = async (
         .andWhere("externalInvoice.status = 'unpaid'")
         .getCount();
 
+    const totalPending = await baseQb
+        .clone()
+        .andWhere("externalInvoice.status = 'pending'")
+        .getCount();
+
     const totalAmount = await baseQb
         .clone()
         .select("SUM(externalInvoice.amount)", "sum")
@@ -262,6 +295,7 @@ export const getAllExternalInvoices = async (
             totalInvoices: total,
             totalPaid,
             totalUnpaid,
+            totalPending,
             totalAmount: parseFloat(totalAmount?.sum || "0"),
         },
     };
@@ -345,8 +379,8 @@ export const recoverExternalInvoice = async (invoiceId: number, username?: strin
     }
 
     // Clear deletion info
-    invoice.deletedAt = undefined;
-    invoice.deletedBy = undefined;
+    invoice.deletedAt = null;
+    invoice.deletedBy = null;
     await externalInvoiceRepo.save(invoice);
 
     // Emit recovery event

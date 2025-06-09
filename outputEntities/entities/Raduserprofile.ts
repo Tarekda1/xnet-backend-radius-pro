@@ -4,8 +4,10 @@ import {
   Index,
   JoinColumn,
   ManyToOne,
+  OneToMany,
   PrimaryGeneratedColumn,
 } from "typeorm";
+import { Invoices } from "./Invoices";
 import { Radprofile } from "./Radprofile";
 
 @Index("profile_id", ["profileId"], {})
@@ -50,6 +52,9 @@ export class Raduserprofile {
     default: () => "'active'",
   })
   accountStatus: string | null;
+
+  @OneToMany(() => Invoices, (invoices) => invoices.userProfile)
+  invoices: Invoices[];
 
   @ManyToOne(() => Radprofile, (radprofile) => radprofile.raduserprofiles, {
     onDelete: "NO ACTION",

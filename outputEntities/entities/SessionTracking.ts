@@ -1,8 +1,8 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn } from "typeorm";
 
+@Index("idx_username", ["username"], {})
 @Index("idx_session", ["sessionId"], {})
 @Index("idx_status", ["status"], {})
-@Index("idx_username", ["username"], {})
 @Entity("session_tracking", { schema: "radius" })
 export class SessionTracking {
   @PrimaryGeneratedColumn({ type: "bigint", name: "id" })

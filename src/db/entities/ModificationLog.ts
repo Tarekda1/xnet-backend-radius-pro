@@ -1,26 +1,38 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, ManyToOne } from 'typeorm';
-import { ExternalInvoice } from './ExternalInvoice';
-
-@Entity('modification_logs')
-export class ModificationLog {
-    @PrimaryGeneratedColumn()
+import {
+    Column,
+    Entity,
+    JoinColumn,
+    ManyToOne,
+    PrimaryGeneratedColumn,
+  } from "typeorm";
+  import { ExternalInvoice } from "./ExternalInvoice";
+  
+  @Entity("modification_logs", { schema: "radius" })
+  export class ModificationLog {
+    @PrimaryGeneratedColumn({ type: "int", name: "id" })
     id: number;
-
-    @Column({ type :"int", nullable: true})
-    invoiceId: number;
-
-    @Column()
-    username: string;
-
-    @Column()
+  
+    @Column("varchar", { name: "action", length: 255 })
     action: string;
-
-    @CreateDateColumn()
+  
+    @Column("json", { name: "changes", nullable: true })
+    changes: object | null;
+  
+    @Column("varchar", { name: "username", length: 255 })
+    username: string;
+  
+    @Column("datetime", {
+      name: "timestamp",
+      default: () => "'CURRENT_TIMESTAMP(6)'",
+    })
     timestamp: Date;
-
-    @Column('json', { nullable: true })
-    changes: Record<string, any>;
-
-    @ManyToOne(() => ExternalInvoice, { onDelete: 'SET NULL' })
+  
+    @ManyToOne(
+      () => ExternalInvoice,
+      (externalInvoice) => externalInvoice.modificationLog,
+      { onDelete: "CASCADE", onUpdate: "NO ACTION" }
+    )
+    @JoinColumn([{ name: "invoiceId", referencedColumnName: "id" }])
     invoice: ExternalInvoice;
-}
+  }
+  

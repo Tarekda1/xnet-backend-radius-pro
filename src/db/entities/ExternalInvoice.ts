@@ -1,62 +1,68 @@
-// src/entities/ExternalInvoice.ts
-import { Entity, PrimaryGeneratedColumn, Column, UpdateDateColumn, DeleteDateColumn } from "typeorm";
+import { Column, Entity, OneToMany, PrimaryGeneratedColumn } from "typeorm";
+import { ModificationLog } from "./ModificationLog";
 
 @Entity("external_invoices", { schema: "radius" })
 export class ExternalInvoice {
-  @PrimaryGeneratedColumn()
+  @PrimaryGeneratedColumn({ type: "int", name: "id" })
   id?: number;
 
-  @Column("varchar", { length: 64 })
-  username!: string;
+  @Column("varchar", { name: "username", length: 64 })
+  username: string;
 
-  @Column("varchar", { length: 128 })
-  fullName!: string;
+  @Column("varchar", { name: "email", length: 128 })
+  email: string;
 
-  @Column("varchar", { length: 128 })
-  email?: string;
+  @Column("text", { name: "address", nullable: true })
+  address: string | null;
 
-  @Column("varchar", { length: 32 })
-  phoneNumber!: string;
+  @Column("float", { name: "amount", precision: 12 })
+  amount: number;
 
-  @Column("text", { nullable: true })
-  address!: string;
+  @Column("varchar", { name: "status", length: 10, default: () => "'unpaid'" })
+  status: string;
 
-  @Column({ type: "varchar", length: 10, default: "" })
-  provider!: string;
+  @Column("varchar", { name: "fullName", length: 128 })
+  fullName: string;
 
-  @Column("date")
-  billingMonth!: Date;
+  @Column("varchar", { name: "phoneNumber", length: 32 })
+  phoneNumber: string;
 
-  @Column("float")
-  amount!: number;
+  @Column("date", { name: "billingMonth" })
+  billingMonth: string;
 
-  @Column({ type: "varchar", length: 10, default: "unpaid" })
-  status!: "paid" | "unpaid";
+  @Column("timestamp", {
+    name: "createdAt",
+    default: () => "CURRENT_TIMESTAMP",
+  })
+  createdAt: Date;
 
-  @Column({ type: "timestamp", default: () => "CURRENT_TIMESTAMP" })
-  createdAt?: Date;
+  @Column("timestamp", { name: "paidAt", nullable: true })
+  paidAt: Date | null;
 
-  @Column({ type: "timestamp", nullable: true })
-  paidAt?: Date | null;
+  @Column("varchar", { name: "modifiedBy", nullable: true, length: 64 })
+  modifiedBy?: string | null;
 
+  @Column("varchar", { name: "deletedBy", nullable: true, length: 64 })
+  deletedBy?: string | null;
 
-  @Column("varchar", { length: 64, nullable: true })
-  modifiedBy?: string;
+  @Column("varchar", { name: "lastAction", nullable: true, length: 255 })
+  lastAction: string | null;
 
-  @UpdateDateColumn()
-  modifiedAt?: Date;
+  @Column("varchar", { name: "provider", length: 10 })
+  provider: string;
 
-  @DeleteDateColumn()
-  deletedAt?: Date;
-
-  @Column({
-    name: 'deletedBy',
-    type: 'varchar',
-    length: 64,
+  @Column("datetime", {
+    name: "modifiedAt",
     nullable: true,
   })
-  deletedBy?: string;
+  modifiedAt?: Date | null;
 
-  @Column({ type:"varchar", nullable: true })
-  lastAction?: string;
+  @Column("datetime", { name: "deletedAt", nullable: true })
+  deletedAt?: Date | null;
+
+  @OneToMany(
+    () => ModificationLog,
+    (modificationLog) => modificationLog.invoice
+  )
+  modificationLog?: ModificationLog[];
 }

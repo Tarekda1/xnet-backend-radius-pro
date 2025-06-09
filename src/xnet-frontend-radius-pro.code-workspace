@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../../xnet-frontend-radius-pro"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../radius-docker-image"
+		}
+	],
+	"settings": {}
+}

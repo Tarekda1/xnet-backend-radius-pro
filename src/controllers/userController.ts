@@ -13,6 +13,7 @@ import { CacheService } from '../services/cacheService';
 import { QuotaService } from '../services/quotaServices';
 import { UserDetails } from '../db/entities/UserDetails';
 import { SessionTracking } from '../db/entities/SessionTracking';
+import { Invoices } from '../db/entities/Invoices';
 
 
 
@@ -21,20 +22,34 @@ const sendResponse = (res: Response, success: boolean, status: number, message: 
 };
 
 const deleteCacheKeys = async () => {
-    let tmpcursor = 0; // Ensure cursor is a number
+    try {
+        // Patterns to match different types of user caches
+        const patterns = [
+            "users_page_*",      // For paginated user lists
+            "users_status_*",    // For user online status
+            "user:*",            // For individual user caches
+            "user_search_*"      // For search results
+        ];
 
-    do {
-        const { cursor, keys }: { cursor: number; keys: string[]; } = await redisClient.scan(tmpcursor, {
-            MATCH: "users_page_*",
-            COUNT: 100
-        });
+        for (const pattern of patterns) {
+            let tmpcursor = 0;
+            do {
+                const { cursor, keys }: { cursor: number; keys: string[]; } = await redisClient.scan(tmpcursor, {
+                    MATCH: pattern,
+                    COUNT: 100
+                });
 
-        tmpcursor = cursor; // Update cursor
+                tmpcursor = cursor;
 
-        if (keys.length > 0) {
-            await redisClient.del(keys); // Delete matching keys
+                if (keys.length > 0) {
+                    await redisClient.del(keys);
+                }
+            } while (tmpcursor !== 0);
         }
-    } while (tmpcursor !== 0);
+    } catch (error) {
+        console.error("Error clearing cache:", error);
+        throw new Error("Failed to clear cache");
+    }
 };
 
 function formatUsersWithStatus(entities: any, raw: any) {
@@ -57,11 +72,26 @@ export const UserController = {
             const offset = (page - 1) * limit;
 
             const cacheKey = `users_page_${page}_limit_${limit}`;
+            const statusCacheKey = `users_status_${page}_limit_${limit}`;
 
-            // 🔹 Check Redis cache first
+            // 🔹 Check Redis cache for user data
             const cachedResponse = await redisClient.get(cacheKey);
-            if (cachedResponse) {
-                return sendResponse(res, true, 200, "Users fetched successfully", JSON.parse(cachedResponse));
+            const cachedStatus = await redisClient.get(statusCacheKey);
+
+            if (cachedResponse && cachedStatus) {
+                const userData = JSON.parse(cachedResponse);
+                const statusData = JSON.parse(cachedStatus);
+                
+                // Merge the cached user data with fresh status data
+                const mergedData = {
+                    ...userData,
+                    users: userData.users.map((user: any) => ({
+                        ...user,
+                        isOnline: statusData[user.username] || false
+                    }))
+                };
+                
+                return sendResponse(res, true, 200, "Users fetched successfully", mergedData);
             }
 
             const userRepository = AppDataSource.getRepository(Raduserprofile);
@@ -74,25 +104,25 @@ export const UserController = {
             // 🔹 Fetch users with profile relation and left join UserMac
             const { entities, raw } = await userRepository
                 .createQueryBuilder("user")
-                .leftJoinAndSelect("user.profile", "profile") // Join user profiles
+                .leftJoinAndSelect("user.profile", "profile")
                 .leftJoinAndMapOne(
                     "user.macAddress",
                     UserMac,
                     "mac",
                     "user.username = mac.username"
-                ) // Left join UserMac to get macAddress (or null)
+                )
                 .leftJoinAndMapOne(
                     "user.password",
                     Radcheck,
                     "radcheck",
                     "user.username = radcheck.username AND radcheck.attribute = 'Cleartext-Password'"
-                ) // Left join Radcheck for password
+                )
                 .leftJoinAndMapOne(
                     "user.userDetails",
                     UserDetails,
                     "userDetails",
                     "user.username = userDetails.username"
-                ) // Left join UserDetails
+                )
                 .leftJoinAndMapOne(
                     "user.session",
                     SessionTracking,
@@ -113,8 +143,8 @@ export const UserController = {
                     "profile.monthlyQuota",
                     "profile.speedDown",
                     "profile.speedUp",
-                    "mac.macAddress", // Ensure MAC address is included
-                    "radcheck.value",  // Ensure password is included
+                    "mac.macAddress",
+                    "radcheck.value",
                     "userDetails.fullName",
                     "userDetails.address",
                     "userDetails.phoneNumber",
@@ -122,18 +152,22 @@ export const UserController = {
                     "session.id"
                 ])
                 .addSelect("session.id IS NOT NULL", "isOnline")
-                .orderBy("user.id", "ASC") // Sort by user ID
+                .orderBy("user.id", "ASC")
                 .limit(limit)
                 .offset(offset)
                 .getRawAndEntities();
-
-            console.log('raw', raw);
 
             const users = formatUsersWithStatus(entities, raw);
 
             if (users.length === 0) {
                 return sendResponse(res, true, 200, "No users found", []);
             }
+
+            // Create a status map for caching
+            const statusMap = users.reduce((acc: any, user: any) => {
+                acc[user.username] = user.isOnline;
+                return acc;
+            }, {});
 
             // 🔹 Structure response with pagination metadata
             const responseData = {
@@ -144,8 +178,11 @@ export const UserController = {
                 users
             };
 
-            // 🔹 Cache the full response (including pagination metadata)
+            // Cache user data for 1 hour
             await redisClient.set(cacheKey, JSON.stringify(responseData), { EX: 3600 });
+            
+            // Cache status data for only 30 seconds
+            await redisClient.set(statusCacheKey, JSON.stringify(statusMap), { EX: 30 });
 
             return sendResponse(res, true, 200, "Users fetched successfully", responseData);
         } catch (error) {
@@ -340,10 +377,23 @@ export const UserController = {
     deleteUser: async (req: Request, res: Response) => {
         const { username } = req.params;
         try {
-            // Use AppDataSource.getRepository for consistency
             const userRepository = AppDataSource.getRepository(Raduserprofile);
             const radcheckRepository = AppDataSource.getRepository(Radcheck);
             const userDetailsRepository = AppDataSource.getRepository(UserDetails);
+            const invoiceRepository = AppDataSource.getRepository(Invoices);
+
+            // First find the user to get their ID
+            const user = await userRepository.findOne({ where: { username } });
+            if (!user) {
+                return sendResponse(res, false, 404, 'User not found');
+            }
+
+            // Delete related invoices first
+            await invoiceRepository
+                .createQueryBuilder()
+                .delete()
+                .where("user_profile_id = :userId", { userId: user.id })
+                .execute();
 
             // Remove user from UserDetails
             const userDetails = await userDetailsRepository.findOne({ where: { username } });
@@ -351,11 +401,7 @@ export const UserController = {
                 await userDetailsRepository.remove(userDetails);
             }
 
-            // Check if the user exists in Raduserprofile
-            const user = await userRepository.findOne({ where: { username } });
-            if (!user) {
-                return sendResponse(res, false, 404, 'User not found');
-            }
+            // Remove user from Raduserprofile
             await userRepository.remove(user);
 
             // Remove user from Radcheck
@@ -368,7 +414,7 @@ export const UserController = {
             await redisClient.del(`user:${username}`); // Invalidate individual user cache
             sendResponse(res, true, 200, 'User deleted successfully');
         } catch (error) {
-            console.error(error);
+            console.error('Error deleting user:', error);
             sendResponse(res, false, 500, 'Error deleting user');
         }
     },
@@ -381,6 +427,7 @@ export const UserController = {
                 return sendResponse(res, false, 404, 'MAC address not found for the user');
             }
             await userMacRepository.remove(userMac);
+            await deleteCacheKeys();
             await redisClient.del(`user:${username}`); // Invalidate individual user cache
             sendResponse(res, true, 200, 'MAC address reset successfully');
         } catch (error) {

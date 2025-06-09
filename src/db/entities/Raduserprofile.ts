@@ -4,24 +4,23 @@ import {
   Index,
   JoinColumn,
   ManyToOne,
-  OneToOne,
+  OneToMany,
   PrimaryGeneratedColumn,
 } from "typeorm";
+import { Invoices } from "./Invoices";
 import { Radprofile } from "./Radprofile";
-import { UserMac } from "./UserMac";
-import { UserDetails } from "./UserDetails";
 
 @Index("profile_id", ["profileId"], {})
 @Entity("raduserprofile", { schema: "radius" })
 export class Raduserprofile {
   @PrimaryGeneratedColumn({ type: "int", name: "id" })
-  id!: number;
+  id: number;
 
   @Column("varchar", { name: "username", length: 64 })
-  username!: string;
+  username: string;
 
   @Column("int", { name: "profile_id" })
-  profileId!: number;
+  profileId: number;
 
   @Column("tinyint", {
     name: "is_fallback",
@@ -29,7 +28,7 @@ export class Raduserprofile {
     width: 1,
     default: () => "'0'",
   })
-  isFallback!: boolean | null;
+  isFallback: boolean | null;
 
   @Column("tinyint", {
     name: "is_monthly_exceeded",
@@ -37,14 +36,14 @@ export class Raduserprofile {
     width: 1,
     default: () => "'0'",
   })
-  isMonthlyExceeded!: boolean | null;
+  isMonthlyExceeded: boolean | null;
 
   @Column("int", {
     name: "quota_reset_day",
     nullable: true,
     default: () => "'1'",
   })
-  quotaResetDay!: number | null;
+  quotaResetDay: number | null;
 
   @Column("varchar", {
     name: "account_status",
@@ -52,14 +51,15 @@ export class Raduserprofile {
     length: 20,
     default: () => "'active'",
   })
-  accountStatus!: string | null;
+  accountStatus: string | null;
+
+  @OneToMany(() => Invoices, (invoices) => invoices.userProfile)
+  invoices: Invoices[];
 
   @ManyToOne(() => Radprofile, (radprofile) => radprofile.raduserprofiles, {
     onDelete: "NO ACTION",
     onUpdate: "NO ACTION",
   })
   @JoinColumn([{ name: "profile_id", referencedColumnName: "id" }])
-  profile!: Radprofile;
-
-  isOnline?: boolean;
+  profile: Radprofile;
 }

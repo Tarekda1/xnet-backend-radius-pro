@@ -9,7 +9,7 @@ import {
   PrimaryGeneratedColumn,
 } from "typeorm";
 import { Radcheck } from "./Radcheck";
-import { Invoice } from "./Invoice";
+import { Invoices } from "./Invoices";
 
 @Index("username", ["username"], { unique: true })
 @Entity("user_details", { schema: "radius" })
@@ -39,7 +39,7 @@ export class UserDetails {
   @JoinColumn([{ name: "username", referencedColumnName: "username" }])
   username2!: Radcheck;
 
-  @OneToMany(() => Invoice, (invoice) => invoice.userDetails)
-  invoices!: Invoice[];
+  @OneToMany(() => Invoices, (invoice) => invoice.userDetails)
+  invoices!: Invoices[];
 
 }

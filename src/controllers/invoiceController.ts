@@ -94,6 +94,24 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
     // Optional: validate/transform
     const invoices: ExternalInvoice[] = raw.map((row: any) => {
       console.log(`row: ${JSON.stringify(row)}`);
+      
+      // Format billing month as YYYY-MM-DD
+      let billingDate;
+      if (row.billingMonth) {
+        const date = new Date(row.billingMonth);
+        if (isNaN(date.getTime())) {
+          // If invalid date, use current month
+          const today = new Date();
+          billingDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
+        } else {
+          billingDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`;
+        }
+      } else {
+        // If no date provided, use current month
+        const today = new Date();
+        billingDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
+      }
+      
       let inv = {
         username: row.username,
         fullName: row.fullName,
@@ -101,14 +119,14 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
         provider: row.provider,
         phoneNumber: row.phoneNumber,
         address: row.address,
-        billingMonth: new Date(row.billingMonth),
+        billingMonth: billingDate,
         amount: parseFloat(row.amount || 30),
-        status: row.status || "unpaid",
+        status: row.status || "pending",
         paidAt: row.paidAt ? new Date(row.paidAt) : null,
         createdBy: req.user?.username,
-        createdAt: new Date(),
+        createdAt: new Date()||null,
         modifiedBy: req.user?.username,
-        modifiedAt: new Date(),
+        modifiedAt: new Date()||null,
         lastAction: "UPLOAD"
       }
       return inv;

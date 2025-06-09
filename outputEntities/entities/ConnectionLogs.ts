@@ -14,6 +14,13 @@ export class ConnectionLogs {
   @Column("varchar", { name: "nas_ip", nullable: true, length: 15 })
   nasIp: string | null;
 
+  @Column("datetime", {
+    name: "timestamp",
+    nullable: true,
+    default: () => "CURRENT_TIMESTAMP",
+  })
+  timestamp: Date | null;
+
   @Column("enum", {
     name: "status",
     nullable: true,
@@ -39,11 +46,4 @@ export class ConnectionLogs {
     | "session-timeout"
     | "lost-carrier"
     | null;
-
-  @Column("datetime", {
-    name: "timestamp",
-    nullable: true,
-    default: () => "CURRENT_TIMESTAMP",
-  })
-  timestamp: Date | null;
 }

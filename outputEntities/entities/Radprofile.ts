@@ -27,6 +27,9 @@ export class Radprofile {
   @Column("int", { name: "speed_up", nullable: true, default: () => "'0'" })
   speedUp: number | null;
 
+  @Column("int", { name: "price", nullable: true, default: () => "'0'" })
+  price: number | null;
+
   @Column("int", {
     name: "session_timeout",
     nullable: true,

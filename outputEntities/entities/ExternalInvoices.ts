@@ -1,0 +1,68 @@
+import { Column, Entity, OneToMany, PrimaryGeneratedColumn } from "typeorm";
+import { ModificationLogs } from "./ModificationLogs";
+
+@Entity("external_invoices", { schema: "radius" })
+export class ExternalInvoices {
+  @PrimaryGeneratedColumn({ type: "int", name: "id" })
+  id: number;
+
+  @Column("varchar", { name: "username", length: 64 })
+  username: string;
+
+  @Column("varchar", { name: "email", length: 128 })
+  email: string;
+
+  @Column("text", { name: "address", nullable: true })
+  address: string | null;
+
+  @Column("float", { name: "amount", precision: 12 })
+  amount: number;
+
+  @Column("varchar", { name: "status", length: 10, default: () => "'unpaid'" })
+  status: string;
+
+  @Column("varchar", { name: "fullName", length: 128 })
+  fullName: string;
+
+  @Column("varchar", { name: "phoneNumber", length: 32 })
+  phoneNumber: string;
+
+  @Column("date", { name: "billingMonth" })
+  billingMonth: string;
+
+  @Column("timestamp", {
+    name: "createdAt",
+    default: () => "CURRENT_TIMESTAMP",
+  })
+  createdAt: Date;
+
+  @Column("timestamp", { name: "paidAt", nullable: true })
+  paidAt: Date | null;
+
+  @Column("varchar", { name: "modifiedBy", nullable: true, length: 64 })
+  modifiedBy: string | null;
+
+  @Column("varchar", { name: "deletedBy", nullable: true, length: 64 })
+  deletedBy: string | null;
+
+  @Column("varchar", { name: "lastAction", nullable: true, length: 255 })
+  lastAction: string | null;
+
+  @Column("varchar", { name: "provider", length: 10 })
+  provider: string;
+
+  @Column("datetime", {
+    name: "modifiedAt",
+    default: () => "'CURRENT_TIMESTAMP(6)'",
+  })
+  modifiedAt: Date;
+
+  @Column("datetime", { name: "deletedAt", nullable: true })
+  deletedAt: Date | null;
+
+  @OneToMany(
+    () => ModificationLogs,
+    (modificationLogs) => modificationLogs.invoice
+  )
+  modificationLogs: ModificationLogs[];
+}

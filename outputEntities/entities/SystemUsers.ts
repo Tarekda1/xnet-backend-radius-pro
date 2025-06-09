@@ -7,10 +7,10 @@ import {
 } from "typeorm";
 import { RefreshTokens } from "./RefreshTokens";
 
+@Index("username", ["username"], { unique: true })
 @Index("email", ["email"], { unique: true })
 @Index("IDX_524dc73f94ac2e5120dfd7ed4b", ["username"], { unique: true })
 @Index("IDX_73dff187ed765e8403bf5fc911", ["email"], { unique: true })
-@Index("username", ["username"], { unique: true })
 @Entity("system_users", { schema: "radius" })
 export class SystemUsers {
   @PrimaryGeneratedColumn({ type: "int", name: "id" })
