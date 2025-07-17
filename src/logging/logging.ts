@@ -10,28 +10,49 @@ import { AppDataSource } from '../db/config';
 class Logger {
   private static instance: winston.Logger;
 
+  private static createLogger(params?: { level?: string; format?: winston.Logform.Format }): winston.Logger {
+    const baseTransports: winston.transport[] = [
+      new winston.transports.Console(),
+      new winston.transports.File({ filename: 'combined.log' })
+    ];
+
+    // Only add TypeORM transport if DataSource is initialized
+    if (AppDataSource.isInitialized) {
+      try {
+        const logRepository = AppDataSource.getRepository(Logs);
+        baseTransports.push(new TypeOrmTransport({ repository: logRepository }));
+      } catch (err) {
+        console.warn('🟡 Logger: Unable to attach TypeORM transport (repository not available yet). Falling back to file/console.', err);
+      }
+    } else {
+      console.warn('🟡 Logger: AppDataSource not initialized. Using file/console transports only.');
+    }
+
+    return winston.createLogger({
+      level: params?.level || 'info',
+      format: params?.format || winston.format.combine(
+        winston.format.colorize(),
+        winston.format.json()
+      ),
+      transports: baseTransports
+    });
+  }
 
   // Private constructor to enforce singleton
   private constructor() {}
 
   public static getInstance(params?: { level?: string; format?: winston.Logform.Format }): winston.Logger {
     if (!Logger.instance) {
-      // Retrieve the repository here once the connection is established
-      const logRepository = AppDataSource.getRepository(Logs);
-      const typeOrmTransport = new TypeOrmTransport({ repository: logRepository });
-
-      Logger.instance = winston.createLogger({
-        level: params?.level || 'info',
-        format: params?.format || winston.format.combine(
-          winston.format.colorize(),
-          winston.format.json()
-        ),
-        transports: [
-          new winston.transports.Console(),
-          new winston.transports.File({ filename: 'combined.log' }),
-          typeOrmTransport
-        ]
-      });
+      Logger.instance = Logger.createLogger(params);
+    } else if (AppDataSource.isInitialized && !(Logger.instance.transports.some(t => t instanceof TypeOrmTransport))) {
+      // Add DB transport dynamically once DataSource is ready
+      try {
+        const logRepository = AppDataSource.getRepository(Logs);
+        Logger.instance.add(new TypeOrmTransport({ repository: logRepository }));
+        console.log('✅ Logger: TypeORM transport attached after DataSource initialization');
+      } catch (err) {
+        console.warn('🟡 Logger: Failed to add TypeORM transport post-initialization', err);
+      }
     }
     return Logger.instance;
   }
@@ -48,9 +69,8 @@ export function requestLogger(req: Request, res: Response, next: NextFunction) {
 export const loggerMiddleware = expressWinston.logger({
   transports: [
     new winston.transports.Console(),
-    new winston.transports.File({ filename: 'combined.log' }),
-    // Create a new transport instance using the repository. Note: Ensure your connection is active.
-    new TypeOrmTransport({ repository:   AppDataSource.getRepository(Logs) })
+    new winston.transports.File({ filename: 'combined.log' })
+    // DB transport will be added dynamically once DataSource is ready
   ],
   format: winston.format.combine(
     winston.format.colorize(),

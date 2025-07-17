@@ -1,16 +1,37 @@
 import { EventEmitter } from 'events';
+import eventBus from '../bus/eventBusSingleton';
+import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 
 export interface InvoiceModification {
     invoiceId: number;
     username: string;
-    action: 'UPDATE' | 'DELETE' | 'PAY' | 'RECOVER';
+    action: 'UPDATED' | 'DELETED' | 'PAID' | 'RECOVERED';
     timestamp: Date;
     changes?: Record<string, any>;
+    data?:ExternalInvoice;
 }
 
 class InvoiceEventEmitter extends EventEmitter {
-    emitModification(modification: InvoiceModification) {
+    async emitModification(modification: InvoiceModification) {
+        // Emit local event
         this.emit('invoice:modification', modification);
+        
+        // Also publish to RabbitMQ
+        try {
+            if (!eventBus.isConnected()) {
+                await eventBus.connect();
+            }
+            
+            await eventBus.publish({
+                type: 'INVOICE_MODIFICATION',
+                title: 'Invoice Modified',
+                message: `Invoice #${modification.invoiceId} username: ${modification.data?.username} has been ${modification.action.toLowerCase()}`,
+                data: modification,
+                timestamp: new Date()
+            });
+        } catch (error) {
+            console.error('Error publishing invoice modification to RabbitMQ:', error);
+        }
     }
 }
 
