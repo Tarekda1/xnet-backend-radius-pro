@@ -1,24 +1,26 @@
-# Use an official Node runtime as a parent image
-FROM node:18-alpine
+# Use Node.js LTS version
+FROM node:20-alpine
 
-# Set the working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Install necessary system utilities including radclient
-RUN apk add --no-cache freeradius freeradius-utils
-
-# Copy package.json and package-lock.json
+# Copy package.json and lock file
 COPY package*.json ./
 
-# Install any needed packages
-RUN npm install
-RUN npm install -g nodemon
+# Force clean install
+RUN npm ci
 
-# Copy the rest of your application code
+# Ensure node-routeros is available
+RUN npm list node-routeros || npm install node-routeros
+
+# Copy the rest of the app
 COPY . .
 
-# Expose the port your app runs on
+# Build TypeScript
+RUN npm run build
+
+# Expose app port
 EXPOSE 3000
 
-# Run the application
-CMD ["npm", "run", "dev"]
+# Run the app
+CMD ["npm", "start"]

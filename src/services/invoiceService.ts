@@ -328,7 +328,7 @@ export const updateExternalInvoice = async (invoiceId: number, updateData: Parti
     invoiceEvents.emitModification({
         invoiceId: invoice.id || -1,
         username: updateData.modifiedBy || 'system',
-        action: 'UPDATE',
+        action: 'UPDATED',
         timestamp: new Date(),
         changes
     });
@@ -354,7 +354,7 @@ export const deleteExternalInvoice = async (invoiceId: number, username?: string
     invoiceEvents.emitModification({
         invoiceId: invoice.id || -1,
         username: username || 'system',
-        action: 'DELETE',
+        action: 'DELETED',
         timestamp: new Date()
     });
 
@@ -387,7 +387,7 @@ export const recoverExternalInvoice = async (invoiceId: number, username?: strin
     invoiceEvents.emitModification({
         invoiceId: invoice.id || -1,
         username: username || 'system',
-        action: 'RECOVER',
+        action: 'RECOVERED',
         timestamp: new Date()
     });
 

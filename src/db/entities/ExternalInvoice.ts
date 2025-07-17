@@ -1,4 +1,4 @@
-import { Column, Entity, OneToMany, PrimaryGeneratedColumn } from "typeorm";
+import { Column, Entity, OneToMany, PrimaryGeneratedColumn, DeleteDateColumn } from "typeorm";
 import { ModificationLog } from "./ModificationLog";
 
 @Entity("external_invoices", { schema: "radius" })
@@ -57,7 +57,7 @@ export class ExternalInvoice {
   })
   modifiedAt?: Date | null;
 
-  @Column("datetime", { name: "deletedAt", nullable: true })
+  @DeleteDateColumn({ name: "deletedAt", type: "datetime", nullable: true })
   deletedAt?: Date | null;
 
   @OneToMany(

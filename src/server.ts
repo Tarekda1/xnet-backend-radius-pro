@@ -13,11 +13,11 @@ import { errorHandler } from './middleware/errorHandler';
 import { apiLimiter } from './middleware/rateLimiter';
 import { securityMiddleware } from './middleware/security';
 import dotenv from 'dotenv';
-import { loggerMiddleware, requestLogger } from './logging/logging';
+import { Logger, loggerMiddleware, requestLogger } from './logging/logging';
 import 'reflect-metadata';
 import profileRoutes from './routes/profileRoutes';
 import sessionRoutes from './routes/sessionRoutes';
-import http from 'http';
+import { createServer } from 'http';
 import { startConsumer } from './bus/userActionsConsumer';
 import nasRoutes from './routes/nasRoutes';
 import cron from "node-cron";
@@ -25,7 +25,11 @@ import { generateMonthlyInvoices } from './services/invoiceService';
 import { SessionTrackingWatcher } from './watchers/SessionTrackingWatcher';
 import { WebSocketServer } from 'ws';
 import invoiceRoutes from './routes/invoiceRoutes';
+import alertRoutes from './routes/alertRoutes';
+import bandwidthRoutes from './routes/bandwidthRoutes';
 import './events/invoiceListeners'
+import cors from 'cors';
+import eventBus from './bus/eventBusSingleton';
 
 dotenv.config();
 
@@ -34,38 +38,24 @@ const app = express();
 // Middleware to parse JSON bodies
 app.use(express.json());
 
+// Enable CORS
+app.use(cors());
 
-const port = process.env.PORT || 3000;
-const server = http.createServer(app);
+const server = createServer(app);
 
 // Create WebSocket server on the same HTTP server
 const wss = new WebSocketServer({ server });
 
-// const io = new SocketIOServer(server, {
-//     cors: {
-//         origin: 'http://localhost:5173',
-//         methods: ['GET', 'POST'],
-//         credentials: true, // optional but helpful
-//     }
-// });
-
-
+// Store connected clients
+const clients = new Set();
 
 wss.on('connection', (ws: any) => {
     console.log('✅ WebSocket client connected');
-
-    // const sendMetrics = () => {
-    //   const metrics = {
-    //     totalOnlineUsers: Math.floor(Math.random() * 50),
-    //     totalActiveUsers: Math.floor(Math.random() * 10),
-    //   };
-    //   ws.send(JSON.stringify(metrics));
-    // };
+    clients.add(ws);
 
     // Start the watcher
     const watcher = new SessionTrackingWatcher(ws);
 
-    // const interval = setInterval(sendMetrics, 5000);
     if (!watcher.started) {
         watcher.start();
         watcher.started = true;
@@ -73,39 +63,19 @@ wss.on('connection', (ws: any) => {
 
     ws.on('close', () => {
         console.log('❌ WebSocket client disconnected');
-        //clearInterval(interval);
+        clients.delete(ws);
     });
 });
 
-
-// io.on('connection', (socket: any) => {
-//     console.log("Client connected:", socket.id);
-
-//     // Start the watcher the first time someone connects
-//     if (!watcher.started) {
-//         watcher.start();
-//         watcher.started = true;
-//     }
-
-//     socket.on('disconnect', () => {
-//         console.log('User disconnected');
-//     });
-// });
-
-// io.on('connection_error', (err) => {
-//     console.error('❌ Socket.IO connection error:', err.message);
-// });
-
-// io.use((socket, next) => {
-//     try {
-//         console.log('🔐 Handshake headers:', socket.handshake.headers);
-//         next(); // Allow the connection
-//     } catch (err: any) {
-//         console.error('Middleware error:', err);
-//         next(err);
-//     }
-// });
-
+// Function to broadcast messages to all connected clients
+export const broadcastMessage = (message: any) => {
+    const messageStr = JSON.stringify(message);
+    clients.forEach((client:any) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(messageStr);
+        }
+    });
+};
 
 // Apply security middlewares
 securityMiddleware(app);
@@ -138,6 +108,10 @@ app.use('/api', profileRoutes);
 app.use('/api', sessionRoutes);
 
 app.use("/api/invoices", invoiceRoutes);
+
+app.use("/api/alerts", alertRoutes);
+
+app.use("/api/bandwidth", bandwidthRoutes);
 
 cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
@@ -234,9 +208,52 @@ startConsumer().catch((err) => console.error('Consumer error:', err));
 
 // Initialize database before starting server
 initializeDB().then(() => {
-    server.listen(port, () => {
-        console.log(`Server is running on http://localhost:${port}`);
+    server.listen(process.env.PORT || 3000, () => {
+        console.log(`Server is running on http://localhost:${process.env.PORT || 3000}`);
     });
+});
+
+process.on('unhandledRejection', (reason) => {
+  Logger.getInstance().error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  Logger.getInstance().error('Uncaught exception:', err);
+});
+
+// WebSocket connection handling
+wss.on('connection', (ws) => {
+  console.log('Client connected');
+
+  // Subscribe to event bus notifications
+  const handleNotification = async (data: any) => {
+    if (ws.readyState === ws.OPEN) {
+      try {
+        await eventBus.publish({
+          type: 'INVOICE_PAID',
+          ...data
+        });
+        ws.send(JSON.stringify({
+          type: 'INVOICE_PAID',
+          ...data
+        }));
+      } catch (error) {
+        console.error('Error publishing notification:', error);
+      }
+    }
+  };
+
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      await handleNotification(data);
+    } catch (error) {
+      console.error('Error handling message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('Client disconnected');
+  });
 });
 
 // export { io }

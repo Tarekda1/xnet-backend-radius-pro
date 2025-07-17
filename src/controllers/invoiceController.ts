@@ -11,6 +11,7 @@ import * as XLSX from "xlsx";
 import fs from "fs";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { invoiceEvents } from "../events/invoiceEvents";
+import eventBus from "../bus/eventBusSingleton";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -51,11 +52,12 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
     }
 
     const invoice = await payInvoice(invoiceId);
+    
     // Emit modification event
-    invoiceEvents.emitModification({
+    await invoiceEvents.emitModification({
       invoiceId: invoice.id || -1,
       username: req.user?.username || 'system',
-      action: 'PAY',
+      action: 'PAID',
       timestamp: new Date(),
     });
 
@@ -188,8 +190,9 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
     invoiceEvents.emitModification({
       invoiceId: invoice.id || -1,
       username: req.user?.username || 'system',
-      action: 'PAY',
+      action: 'PAID',
       timestamp: new Date(),
+      data: invoice
     });
 
     sendResponse(res, true, 200, "Invoice paid successfully", invoice);
