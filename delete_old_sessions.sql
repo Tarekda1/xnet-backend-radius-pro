@@ -23,11 +23,20 @@ CREATE TABLE `modification_logs` (
 
   CONSTRAINT `fk_modlog_invoice`
     FOREIGN KEY (`invoice_id`)
-    REFERENCES `external_invoices` (`id`)
+    REFERENCES `external_invuser_macmodification_logsoices` (`id`)
     ON UPDATE CASCADE
     ON DELETE SET NULL
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4
   COLLATE = utf8mb4_unicode_ci;
+  
+  ALTER TABLE radius.modification_logs DROP FOREIGN KEY FK_23a5a9979484d01b7e8fa7184c2;
+  
+  
+  UPDATE invoices 
+   SET user_profile_id = (SELECT id FROM raduserprofile LIMIT 1)
+   WHERE user_profile_id NOT IN (SELECT id FROM raduserprofile);
+   
+   ALTER TABLE `invoices` ADD CONSTRAINT `FK_35d4fc3e4ffc64b69da20c2f50f` FOREIGN KEY (`user_profile_id`) REFERENCES `raduserprofile`(`id`) ON DELETE CASCADE ON UPDATE NO ACTION;
 
 

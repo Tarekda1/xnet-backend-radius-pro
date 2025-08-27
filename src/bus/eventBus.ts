@@ -25,7 +25,7 @@ export class EventBus {
           password: 'guest'
         }
       });
-      console.log('Successfully deleted queue via management API');
+      // console.log('Successfully deleted queue via management API');
     } catch (error: any) {
       if (error.response?.status === 404) {
         console.log('Queue does not exist in management API');
@@ -49,7 +49,7 @@ export class EventBus {
         durable: true
       });
       
-      console.log('Successfully connected to RabbitMQ and asserted queue:', this.queue);
+      // console.log('Successfully connected to RabbitMQ and asserted queue:', this.queue);
     } catch (error) {
       console.error('Error connecting to RabbitMQ:', error);
       throw error;
@@ -66,7 +66,7 @@ export class EventBus {
     }
     
     try {
-      console.log('Publishing message to queue:', this.queue, 'Message:', message);
+      // console.log('Publishing message to queue:', this.queue, 'Message:', message);
       
       const success = this.channel.sendToQueue(
         this.queue,
@@ -80,7 +80,7 @@ export class EventBus {
       if (!success) {
         console.warn('Message was not sent to queue - queue might be full');
       } else {
-        console.log('Message published successfully');
+        // console.log('Message published successfully');
       }
     } catch (error) {
       console.error('Error publishing message:', error);

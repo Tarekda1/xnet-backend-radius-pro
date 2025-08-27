@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../../radius-docker-image"
+		},
+		{
+			"path": "../../xnet-billling-project"
 		}
 	],
 	"settings": {}
