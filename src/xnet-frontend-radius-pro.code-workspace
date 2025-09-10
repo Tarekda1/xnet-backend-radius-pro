@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../../xnet-billling-project"
+		},
+		{
+			"path": "../../../Users/User/.cloudflared"
 		}
 	],
 	"settings": {}
