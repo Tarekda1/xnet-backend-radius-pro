@@ -7,6 +7,7 @@ import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Radprofile } from "../db/entities/Radprofile";
 import { UserDetails } from "../db/entities/UserDetails";
 import { getOnlineUsers } from "../repo/onlineUsers";
+import eventBus from "../bus/eventBusSingleton";
 
 export const healthCheck = (req: Request, res: Response) => {
   res.status(200).json({ status: 'UP' });
@@ -117,6 +118,29 @@ export const getOnlineUsersMetrics = async (req: Request, res: Response) => {
     data: metrics,
   });
 
+};
+
+export const disconnectOnlineUser = async (req: Request, res: Response) => {
+  try {
+    const { username, ip, code, port } = req.body || {};
+
+    if (!username || !ip || !code) {
+      res.status(400).json({ success: false, message: "username, ip and code are required" });
+    }
+
+    await eventBus.publish({
+      action: "disconnectAndCompleteSession",
+      username,
+      ip,
+      code,
+      port: typeof port === "number" ? port : undefined,
+    });
+
+    res.status(202).json({ success: true, message: "Disconnect scheduled" });
+  } catch (error) {
+    console.error("Error scheduling disconnect:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
 };
 
 

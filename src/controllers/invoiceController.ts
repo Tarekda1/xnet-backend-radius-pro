@@ -12,6 +12,10 @@ import fs from "fs";
 import { ExternalInvoice } from "../db/entities/ExternalInvoice";
 import { invoiceEvents } from "../events/invoiceEvents";
 import eventBus from "../bus/eventBusSingleton";
+import { AppDataSource } from "../db/config";
+import { Invoices } from "../db/entities/Invoices";
+import { UserDetails } from "../db/entities/UserDetails";
+import { composePaidMessage, sendWhatsAppMessage } from "../services/whatsappService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -62,6 +66,29 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
     });
 
     sendResponse(res, true, 200, "Invoice paid successfully", invoice);
+
+    // Fire-and-forget WhatsApp notification (does not block response)
+    ;(async () => {
+      try {
+        const repo = AppDataSource.getRepository(Invoices);
+        const inv = await repo.findOne({
+          where: { id: invoiceId },
+          relations: ["userDetails", "userProfile"],
+        });
+        const user = inv?.userDetails as UserDetails | undefined;
+        const phone = user?.phoneNumber || undefined;
+        if (!phone) return;
+        const message = composePaidMessage({
+          fullName: user?.fullName,
+          username: user?.username,
+          amount: inv?.amount,
+          invoiceId,
+        });
+        await sendWhatsAppMessage({ to: phone, message });
+      } catch (err) {
+        console.warn("Failed to send WhatsApp for internal invoice", err);
+      }
+    })();
   } catch (error) {
     console.error("Error paying invoice:", error);
     res.status(500).json({ message: "Failed to pay invoice" });
@@ -196,6 +223,23 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
     });
 
     sendResponse(res, true, 200, "Invoice paid successfully", invoice);
+
+    // Fire-and-forget WhatsApp notification
+    ;(async () => {
+      try {
+        const phone = invoice.phoneNumber;
+        if (!phone) return;
+        const message = composePaidMessage({
+          fullName: invoice.fullName,
+          username: invoice.username,
+          amount: invoice.amount,
+          invoiceId: invoice.id,
+        });
+        await sendWhatsAppMessage({ to: phone, message });
+      } catch (err) {
+        console.warn("Failed to send WhatsApp for external invoice", err);
+      }
+    })();
   } catch (error) {
     console.error("Error paying invoice:", error);
     res.status(500).json({ message: "Failed to pay invoice" });

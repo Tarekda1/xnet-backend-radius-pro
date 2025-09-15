@@ -17,7 +17,7 @@ export class SessionTrackingWatcher {
     setInterval(async () => {
 
       const userMetrics = await getOnlineUsers();
-      console.log('📤 Emitting metrics:', userMetrics);
+      //console.log('📤 Emitting metrics:', userMetrics);
       this.ws.send(JSON.stringify(userMetrics)); // ✅ emit to all connected clients
 
     }, this.intervalMs);

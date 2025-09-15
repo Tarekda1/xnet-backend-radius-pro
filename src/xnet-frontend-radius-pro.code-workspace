@@ -8,6 +8,15 @@
 		},
 		{
 			"path": "../../radius-docker-image"
+		},
+		{
+			"path": "../../xnet-billling-project"
+<<<<<<< HEAD
+		},
+		{
+			"path": "../../../Users/User/.cloudflared"
+=======
+>>>>>>> 412a750 (enhance backend)
 		}
 	],
 	"settings": {}
