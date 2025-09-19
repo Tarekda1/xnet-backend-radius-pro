@@ -51,6 +51,7 @@
     "socket.io": "^4.8.1",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
+    "twilio": "^5.10.0",
     "ws": "^8.18.1",
     "xlsx": "^0.18.5"
   },

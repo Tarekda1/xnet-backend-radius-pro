@@ -20,6 +20,20 @@ services:
       - MYSQL_USER=radius
       - MYSQL_PASSWORD=password
       - MYSQL_DATABASE=radius
+      # WhatsApp template settings (for Cloud API fallback)
+      - WHATSAPP_TEMPLATE_NAME=payment_confirmation
+      - WHATSAPP_TEMPLATE_LANGUAGE_CODE=en_US
+      # Use Twilio as the WhatsApp provider
+      - WHATSAPP_PROVIDER=twilio
+      # Twilio credentials and sender configuration
+      - TWILIO_ACCOUNT_SID=AC_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      # EITHER use Messaging Service (recommended for production)
+      - TWILIO_MESSAGING_SERVICE_SID=MG_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      # OR specify a From sender (do not set both)
+      - TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+      # Optional delivery status callback
+      - TWILIO_STATUS_CALLBACK_URL=
     depends_on:
       - redis
       - rabbitmq
