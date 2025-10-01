@@ -3,6 +3,8 @@ import axios from "axios";
 type WhatsAppSendOptions = {
     to: string; // E.164 without '+' (WhatsApp Cloud API expects country code without plus)
     message: string;
+    // Optional variables for template-based sends (Twilio Content API)
+    templateVariables?: Record<string, string | number>;
 };
 
 /**
@@ -12,14 +14,14 @@ type WhatsAppSendOptions = {
  * - WHATSAPP_PHONE_NUMBER_ID: Sender phone number id
  * - WHATSAPP_ENABLED: 'true' to enable sending
  */
-export async function sendWhatsAppMessage({ to, message }: WhatsAppSendOptions): Promise<void> {
+export async function sendWhatsAppMessage({ to, message, templateVariables }: WhatsAppSendOptions): Promise<void> {
     if (process.env.WHATSAPP_ENABLED !== 'true') {
         return; // disabled in this environment
     }
 
     const provider = (process.env.WHATSAPP_PROVIDER || 'cloud').toLowerCase();
     if (provider === 'twilio') {
-        return sendViaTwilio({ to, message });
+        return sendViaTwilio({ to, message, templateVariables });
     }
 
     return sendViaCloud({ to, message });
@@ -86,7 +88,7 @@ async function sendViaCloud({ to, message }: WhatsAppSendOptions): Promise<void>
     }
 }
 
-async function sendViaTwilio({ to, message }: WhatsAppSendOptions): Promise<void> {
+async function sendViaTwilio({ to, message, templateVariables }: WhatsAppSendOptions): Promise<void> {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const from = process.env.TWILIO_WHATSAPP_FROM; // e.g. "whatsapp:+14155238886"
@@ -96,50 +98,8 @@ async function sendViaTwilio({ to, message }: WhatsAppSendOptions): Promise<void
         console.warn("Twilio not configured: missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and either TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID");
         return;
     }
-
-    // Normalize to E.164 and prepend whatsapp:
-    // const overrideDigitsTwilio = resolveOverrideDigits();
-    // let digits = (overrideDigitsTwilio || to || "").replace(/\D/g, "");
-    // if (!digits) {
-    //     console.warn("Twilio WhatsApp not sent: invalid recipient phone");
-    //     return;
-    // }
-    // const toParam = `whatsapp:+${digits}`;
-
-    // const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
-    // const params: Record<string, string> = {
-    //     To: toParam, Body: message,  // Either MessagingServiceSid OR From (not both)
-    //     ...(messagingServiceSid
-    //         ? { MessagingServiceSid: messagingServiceSid }
-    //         : { From: from as string }),
-    //     StatusCallback: process.env.TWILIO_STATUS_CALLBACK_URL ?? ""
-    // };
-    // if (messagingServiceSid) {
-    //     params["MessagingServiceSid"] = messagingServiceSid;
-    // } else {
-    //     params["From"] = from as string;
-    // }
-    // const body = new URLSearchParams(params).toString();
-
-    // console.log('body', body);
-
-    // try {
-    //     const { data } = await axios.post(url, body, {
-    //         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    //         auth: { username: accountSid, password: authToken },
-    //         timeout: 10000,
-    //     });
-    //     console.log("Twilio SID:", data.sid);
-    // } catch (error: any) {
-    //     const status = error?.response?.status;
-    //     const data = error?.response?.data;
-    //     console.error("Twilio WhatsApp send failed", { status, data, message: error?.message });
-
-    //     // Fallback: If outside 24h window, try Twilio Content Template (if configured)
-    //     if (isTwilioOutsideWindowError(error)) {
-    await sendViaTwilioTemplate({ to, message });
-    //     }
-    // }
+ 
+    await sendViaTwilioTemplate({ to, message, templateVariables });  
 }
 
 export function composePaidMessage(params: {
@@ -242,7 +202,7 @@ function isTwilioOutsideWindowError(error: any): boolean {
     }
 }
 
-async function sendViaTwilioTemplate({ to, message }: WhatsAppSendOptions): Promise<void> {
+async function sendViaTwilioTemplate({ to, message, templateVariables }: WhatsAppSendOptions): Promise<void> {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const from = process.env.TWILIO_WHATSAPP_FROM;
@@ -269,8 +229,20 @@ async function sendViaTwilioTemplate({ to, message }: WhatsAppSendOptions): Prom
         ContentSid: contentSid,
     };
 
-    // Build ContentVariables JSON. If env provided, use it; otherwise provide {"message": "..."}
+    // Build ContentVariables JSON.
+    // Precedence: explicit templateVariables param > TWILIO_CONTENT_VARIABLES_JSON > default { message }
     let contentVariables = process.env.TWILIO_CONTENT_VARIABLES_JSON;
+    if (templateVariables && Object.keys(templateVariables).length > 0) {
+        try {
+            const normalized: Record<string, string> = {};
+            for (const [k, v] of Object.entries(templateVariables)) {
+                normalized[String(k)] = String(v);
+            }
+            contentVariables = JSON.stringify(normalized);
+        } catch {
+            contentVariables = JSON.stringify({ message });
+        }
+    }
     if (contentVariables) {
         try {
             const parsed = JSON.parse(contentVariables);

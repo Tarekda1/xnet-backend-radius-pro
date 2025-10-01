@@ -84,7 +84,17 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
           amount: inv?.amount,
           invoiceId,
         });
-        await sendWhatsAppMessage({ to: phone, message });
+        const templateName = user?.fullName || user?.username || 'Customer';
+        const amountValue = typeof inv?.amount === 'number' ? inv?.amount.toFixed(2) : String(inv?.amount ?? '');
+        await sendWhatsAppMessage({
+          to: phone,
+          message,
+          templateVariables: {
+            "1": templateName,
+            "2": String(invoiceId),
+            "3": amountValue,
+          }
+        });
       } catch (err) {
         console.warn("Failed to send WhatsApp for internal invoice", err);
       }
@@ -162,8 +172,14 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
     });
 
     console.log(`invoices: ${invoices}`); // for validatio
+    // Filter out users whose username ends with 'xn' (case-insensitive)
+    const filteredInvoices: ExternalInvoice[] = invoices.filter((inv) => {
+      const uname = (inv.fullName ?? '').toString().trim().toLowerCase();
+      return !uname.endsWith('xn');
+    });
+    console.log(`Filtered out ${invoices.length - filteredInvoices.length} invoice(s) ending with 'xn'`);
 
-    await replaceExternalInvoices(invoices);
+    await replaceExternalInvoices(filteredInvoices);
 
     fs.unlinkSync(filePath); // cleanup
     res.status(200).json({ success: true, message: "Invoices uploaded successfully" });
@@ -240,7 +256,17 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
           amount: invoice.amount,
           invoiceId: invoice.id,
         });
-        await sendWhatsAppMessage({ to: phone, message });
+        const templateName = invoice.fullName || invoice.username || 'Customer';
+        const amountValue = typeof invoice.amount === 'number' ? invoice.amount.toFixed(2) : String(invoice.amount ?? '');
+        await sendWhatsAppMessage({
+          to: phone,
+          message,
+          templateVariables: {
+            "1": templateName,
+            "2": String(invoice.id ?? ''),
+            "3": amountValue,
+          }
+        });
       } catch (err) {
         console.warn("Failed to send WhatsApp for external invoice", err);
       }
