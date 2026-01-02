@@ -103,7 +103,7 @@ export const register = [
         throw new Error('Invalid email');
     }), // Email is optional,
     body('password').isString().notEmpty(),
-    body('role').optional().isString().isIn(['admin', 'manager', 'support']),
+    body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector']),
     async (req: Request, res: Response) => {
         const { username, email, password, role } = req.body;
         const userRepository = AppDataSource.getRepository(SystemUsers);
@@ -170,7 +170,7 @@ export const updateUser = [
         throw new Error('Invalid email');
     }),
     body('password').optional().isString(),
-    body('role').optional().isString().isIn(['admin', 'manager', 'support']),
+    body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector']),
     async (req: Request, res: Response) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
@@ -261,7 +261,7 @@ export const login = async (req: Request, res: Response) => {
             return sendResponse(res, false, 401, 'Invalid credentials');
         }
 
-        const accessToken = jwt.sign({ username: user.username }, jwtSecret, { expiresIn: '1Day' });
+        const accessToken = jwt.sign({ username: user.username, role: user.role }, jwtSecret, { expiresIn: '1Day' });
         const refreshToken = jwt.sign({ username: user.username }, refreshTokenSecret);
 
         const newRefreshToken = refreshTokenRepository.create({ token: refreshToken, user });
@@ -314,12 +314,12 @@ export const refreshToken = async (req: Request, res: Response) => {
             if (err) return sendResponse(res, false, 403, 'Invalid refresh token');
 
             // Rotate the refresh token
-            const newRefreshToken = jwt.sign({ username: user.username }, refreshTokenSecret);
+            const newRefreshToken = jwt.sign({ username: user.username, role: user.role }, refreshTokenSecret);
             storedToken.token = newRefreshToken;
             storedToken.createdAt = new Date();
             await refreshTokenRepository.save(storedToken);
 
-            const accessToken = jwt.sign({ username: user.username }, jwtSecret, { expiresIn: '15m' });
+            const accessToken = jwt.sign({ username: user.username, role: user.role }, jwtSecret, { expiresIn: '15m' });
             sendResponse(res, true, 200, 'Token refreshed successfully', { accessToken, refreshToken: newRefreshToken });
         });
     } catch (error) {

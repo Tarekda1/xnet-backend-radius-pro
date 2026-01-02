@@ -5,10 +5,10 @@ import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 export interface InvoiceModification {
     invoiceId: number;
     username: string;
-    action: 'UPDATED' | 'DELETED' | 'PAID' | 'RECOVERED';
+    action: 'UPDATED' | 'DELETED' | 'PAID' | 'RECOVERED' | 'COLLECTED' | 'RECONCILED';
     timestamp: Date;
     changes?: Record<string, any>;
-    data?:ExternalInvoice;
+    data?: any;
 }
 
 class InvoiceEventEmitter extends EventEmitter {

@@ -1,9 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { AppDataSource } from '../db/config';
+import { SystemUsers } from '../db/entities/SystemUsers';
 
 const jwtSecret = 'your_jwt_secret';
 
-export const authenticateToken = (req: Request, res: Response, next: NextFunction): void => {
+export const authenticateToken = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -12,16 +14,38 @@ export const authenticateToken = (req: Request, res: Response, next: NextFunctio
     return;
   }
 
-  jwt.verify(token, jwtSecret, (err: any, user: any) => {
-    if (err) {
-      if (err.name === 'TokenExpiredError') {
-        res.status(401).send('Token expired');
-        return;
+  try {
+    const decoded: any = jwt.verify(token, jwtSecret);
+    let role = decoded?.role as SystemUsers['role'] | undefined;
+
+    // Backward compatibility: older tokens may not have role. Fetch from DB.
+    if (!role && decoded?.username) {
+      try {
+        const userRepo = AppDataSource.getRepository(SystemUsers);
+        const dbUser = await userRepo.findOne({ where: { username: decoded.username } });
+        role = dbUser?.role ?? undefined;
+      } catch (e) {
+        // ignore DB errors here; will fall back to undefined role
       }
-      res.sendStatus(403);
+    }
+
+    req.user = { username: decoded?.username, role } as any;
+    next();
+  } catch (err: any) {
+    if (err?.name === 'TokenExpiredError') {
+      res.status(401).send('Token expired');
       return;
     }
-    req.user = user;
+    res.sendStatus(403);
+  }
+};
+
+export const authorizeRoles = (...allowedRoles: Array<'admin' | 'manager' | 'support' | 'collector'>) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user || !req.user.role || !allowedRoles.includes(req.user.role)) {
+      res.status(403).send('Forbidden');
+      return;
+    }
     next();
-  });
+  };
 };

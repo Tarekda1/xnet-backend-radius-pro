@@ -28,10 +28,10 @@ export class SystemUsers {
   @Column("enum", {
     name: "role",
     nullable: true,
-    enum: ["admin", "manager", "support"],
+    enum: ["admin", "manager", "support", "collector"],
     default: 'support',
   })
-  role: "admin" | "manager" | "support" | null;
+  role: "admin" | "manager" | "support" | "collector" | null;
 
   @Column("tinyint", {
     name: "is_active",

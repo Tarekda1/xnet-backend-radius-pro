@@ -40,6 +40,24 @@ export class Invoices {
   @Column("timestamp", { name: "paid_at", nullable: true })
   paidAt: Date | null;
 
+  @Column("varchar", { name: "payment_method", nullable: true, length: 20 })
+  paymentMethod: string | null;
+
+  @Column("varchar", { name: "collected_by", nullable: true, length: 64 })
+  collectedBy: string | null;
+
+  @Column("timestamp", { name: "collected_at", nullable: true })
+  collectedAt: Date | null;
+
+  @Column("tinyint", { name: "cash_reconciled", width: 1, default: () => "'0'" })
+  cashReconciled: boolean;
+
+  @Column("varchar", { name: "reconciled_by", nullable: true, length: 64 })
+  reconciledBy: string | null;
+
+  @Column("timestamp", { name: "reconciled_at", nullable: true })
+  reconciledAt: Date | null;
+
   @ManyToOne(() => UserDetails, (userDetails) => userDetails.invoices, {
     onDelete: "NO ACTION",
     onUpdate: "NO ACTION",

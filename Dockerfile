@@ -1,5 +1,5 @@
 # Use Node.js LTS version
-FROM node:20-alpine
+FROM ghcr.io/library/node:20-alpine
 
 # Set working directory
 WORKDIR /app

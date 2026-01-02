@@ -39,6 +39,24 @@ export class ExternalInvoice {
   @Column("timestamp", { name: "paidAt", nullable: true })
   paidAt: Date | null;
 
+  @Column("varchar", { name: "paymentMethod", nullable: true, length: 20 })
+  paymentMethod: string | null;
+
+  @Column("varchar", { name: "collectedBy", nullable: true, length: 64 })
+  collectedBy: string | null;
+
+  @Column("timestamp", { name: "collectedAt", nullable: true })
+  collectedAt: Date | null;
+
+  @Column("tinyint", { name: "cashReconciled", width: 1, default: () => "'0'" })
+  cashReconciled: boolean;
+
+  @Column("varchar", { name: "reconciledBy", nullable: true, length: 64 })
+  reconciledBy: string | null;
+
+  @Column("timestamp", { name: "reconciledAt", nullable: true })
+  reconciledAt: Date | null;
+
   @Column("varchar", { name: "modifiedBy", nullable: true, length: 64 })
   modifiedBy?: string | null;
 

@@ -5,7 +5,12 @@ import {
   getAllExternalInvoices, getAllInvoices,
   payInvoice, payExternalInvoice, replaceExternalInvoices,
   updateExternalInvoice,
-  deleteExternalInvoice
+  deleteExternalInvoice,
+  collectInvoice,
+  reconcileInvoiceCash,
+  getCollectedMetrics,
+  getCollectorBreakdown,
+  getCollectedInvoicesList
 } from "../services/invoiceService";
 import * as XLSX from "xlsx";
 import fs from "fs";
@@ -120,10 +125,116 @@ export const bulkPayInvoicesHandler = async (req: Request, res: Response) => {
   }
 };
 
+export const collectInvoiceHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId);
+    if (isNaN(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other';
+    const username = req.user?.username || 'system';
+
+    const invoice = await collectInvoice(invoiceId, username, paymentMethod);
+
+    await invoiceEvents.emitModification({
+      invoiceId: invoice.id || -1,
+      username,
+      action: 'COLLECTED',
+      timestamp: new Date(),
+      data: { paymentMethod }
+    });
+
+    sendResponse(res, true, 200, "Invoice collected and marked as paid", invoice);
+  } catch (error) {
+    console.error("Error collecting invoice:", error);
+    res.status(500).json({ message: "Failed to collect invoice" });
+  }
+};
+
+export const reconcileInvoiceCashHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId);
+    if (isNaN(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+    const username = req.user?.username || 'system';
+
+    const invoice = await reconcileInvoiceCash(invoiceId, username);
+
+    await invoiceEvents.emitModification({
+      invoiceId: invoice.id || -1,
+      username,
+      action: 'RECONCILED',
+      timestamp: new Date(),
+    });
+
+    sendResponse(res, true, 200, "Invoice cash reconciled", invoice);
+  } catch (error) {
+    console.error("Error reconciling invoice:", error);
+    res.status(500).json({ message: "Failed to reconcile invoice" });
+  }
+};
+
+export const getCollectedMetricsHandler = async (req: Request, res: Response) => {
+  try {
+    const { dateFrom, dateTo } = req.query as { dateFrom?: string; dateTo?: string };
+    const metrics = await getCollectedMetrics(dateFrom, dateTo);
+    sendResponse(res, true, 200, "Collected metrics fetched", metrics);
+  } catch (error) {
+    console.error("Error fetching collected metrics:", error);
+    res.status(500).json({ message: "Failed to fetch collected metrics" });
+  }
+};
+
+export const getCollectorBreakdownHandler = async (req: Request, res: Response) => {
+  try {
+    const { dateFrom, dateTo } = req.query as { dateFrom?: string; dateTo?: string };
+    const breakdown = await getCollectorBreakdown(dateFrom, dateTo);
+    sendResponse(res, true, 200, "Collector breakdown fetched", breakdown);
+  } catch (error) {
+    console.error("Error fetching collector breakdown:", error);
+    res.status(500).json({ message: "Failed to fetch collector breakdown" });
+  }
+};
+
+export const getCollectedInvoicesListHandler = async (req: Request, res: Response) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const { dateFrom, dateTo } = req.query as { dateFrom?: string; dateTo?: string };
+    const list = await getCollectedInvoicesList(page, limit, dateFrom, dateTo);
+    sendResponse(res, true, 200, "Collected invoices fetched", list);
+  } catch (error) {
+    console.error("Error fetching collected invoices list:", error);
+    res.status(500).json({ message: "Failed to fetch collected invoices list" });
+  }
+};
+
 export const uploadExternalInvoiceFile = async (req: Request, res: Response) => {
   try {
     const filePath = req.file?.path || '';
     if (!filePath || filePath === undefined || filePath === '') res.status(400).json({ message: "File not found" });
+
+    // Optional month override (e.g., '2025-01' or '2025-01-01')
+    const requestedMonth = (req.body?.billingMonth as string) || (req.query?.billingMonth as string) || '';
+    const normalizeToMonthStart = (value: string): string | null => {
+      if (!value) return null;
+      // Accept YYYY-MM or YYYY-MM-01 or any parsable date
+      let year = 0, month = 0;
+      const ymMatch = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(value);
+      if (ymMatch) {
+        year = parseInt(ymMatch[1], 10);
+        month = parseInt(ymMatch[2], 10);
+      } else {
+        const d = new Date(value);
+        if (isNaN(d.getTime())) return null;
+        year = d.getFullYear();
+        month = d.getMonth() + 1;
+      }
+      if (!year || !month || month < 1 || month > 12) return null;
+      return `${year}-${String(month).padStart(2,'0')}-01`;
+    };
+    const monthOverride = normalizeToMonthStart(requestedMonth) || null;
 
     // Parse Excel
     const workbook = XLSX.readFile(filePath);
@@ -131,12 +242,14 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
     const raw = XLSX.utils.sheet_to_json(sheet);
 
     // Optional: validate/transform
-    const invoices: ExternalInvoice[] = raw.map((row: any) => {
+    const invoices = raw.map((row: any) => {
       console.log(`row: ${JSON.stringify(row)}`);
       
       // Format billing month as YYYY-MM-DD
       let billingDate;
-      if (row.billingMonth) {
+      if (monthOverride) {
+        billingDate = monthOverride;
+      } else if (row.billingMonth) {
         const date = new Date(row.billingMonth);
         if (isNaN(date.getTime())) {
           // If invalid date, use current month
@@ -151,7 +264,7 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
         billingDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
       }
       
-      let inv = {
+      let inv: Partial<ExternalInvoice> = {
         username: row.username,
         fullName: row.fullName,
         email: row.email,
@@ -162,8 +275,6 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
         amount: parseFloat(row.amount || 30),
         status: row.status || "pending",
         paidAt: row.paidAt ? new Date(row.paidAt) : null,
-        createdBy: req.user?.username,
-        createdAt: new Date()||null,
         modifiedBy: req.user?.username,
         modifiedAt: new Date()||null,
         lastAction: "UPLOAD"
@@ -173,7 +284,7 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
 
     console.log(`invoices: ${invoices}`); // for validatio
     // Filter out users whose username ends with 'xn' (case-insensitive)
-    const filteredInvoices: ExternalInvoice[] = invoices.filter((inv) => {
+    const filteredInvoices = invoices.filter((inv) => {
       const uname = (inv.fullName ?? '').toString().trim().toLowerCase();
       return !uname.endsWith('xn');
     });
@@ -211,8 +322,13 @@ export const getExternalInvoicesHandler = async (req: Request, res: Response) =>
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 10;
     const search = req.query.search as string || '';
+    const from = (req.query.from as string) || undefined;
+    const to = (req.query.to as string) || undefined;
+    const status = (req.query.status as string) || undefined;
+    const sortBy = (req.query.sortBy as 'createdAt' | 'billingMonth' | 'amount') || 'createdAt';
+    const sortDir = ((req.query.sortDir as string)?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC') as 'ASC' | 'DESC';
 
-    const result = await getAllExternalInvoices(page, limit, search);
+    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir);
     sendResponse(res, true, 200, "External invoices fetched successfully", result);
   } catch (err) {
     console.error("Error fetching external invoices:", err);
@@ -227,7 +343,10 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
       return sendResponse(res, false, 400, "Invalid invoice ID");
     }
 
-    const invoice = await payExternalInvoice(invoiceId);
+    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other';
+    const actor = req.user?.username || 'system';
+
+    const invoice = await payExternalInvoice(invoiceId, actor, paymentMethod);
 
     // Emit modification event
     invoiceEvents.emitModification({

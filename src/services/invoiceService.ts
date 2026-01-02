@@ -107,7 +107,7 @@ export const payInvoice = async (invoiceId: number) => {
     return invoice;
 };
 
-export const payExternalInvoice = async (invoiceId: number) => {
+export const collectInvoice = async (invoiceId: number, collectorUsername: string, paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' = 'cash') => {
     const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
     const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
@@ -115,7 +115,52 @@ export const payExternalInvoice = async (invoiceId: number) => {
         throw new Error('Invoice not found');
     }
 
+    // Mark as collected and paid in one step
     invoice.status = 'paid';
+    invoice.paidAt = new Date();
+    (invoice as any).paymentMethod = paymentMethod;
+    (invoice as any).collectedBy = collectorUsername;
+    (invoice as any).collectedAt = new Date();
+
+    await invoiceRepo.save(invoice);
+    return invoice;
+};
+
+export const reconcileInvoiceCash = async (invoiceId: number, reconcilerUsername: string) => {
+    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+
+    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
+    if (!invoice) {
+        throw new Error('Invoice not found');
+    }
+
+    (invoice as any).cashReconciled = true;
+    (invoice as any).reconciledBy = reconcilerUsername;
+    (invoice as any).reconciledAt = new Date();
+
+    await invoiceRepo.save(invoice);
+    return invoice;
+};
+
+export const payExternalInvoice = async (
+    invoiceId: number,
+    actorUsername: string,
+    paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' = 'cash'
+) => {
+    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+
+    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
+    if (!invoice) {
+        throw new Error('Invoice not found');
+    }
+
+    // Mark as paid and also capture collection info for EOD reconciliation
+    invoice.status = 'paid';
+    invoice.paidAt = new Date();
+    (invoice as any).paymentMethod = paymentMethod;
+    (invoice as any).collectedBy = actorUsername;
+    (invoice as any).collectedAt = new Date();
+
     await invoiceRepo.save(invoice);
 
     return invoice;
@@ -142,8 +187,8 @@ export const bulkPayInvoices = async (invoiceIds: number[]) => {
 // 1. Merge A and B
 function mergeExternalInvoices(
     source: ExternalInvoice[],
-    incoming: ExternalInvoice[]
-): ExternalInvoice[] {
+    incoming: Partial<ExternalInvoice>[]
+): Partial<ExternalInvoice>[] {
     const sourceMap = new Map(source.map(item => [item.id, item]));
     // Format date as YYYY-MM-DD
     const today = new Date();
@@ -173,7 +218,7 @@ function mergeExternalInvoices(
 
 
 // 2. Update ExternalInvoice Table
-export const replaceExternalInvoices = async (incoming: ExternalInvoice[]) => {
+export const replaceExternalInvoices = async (incoming: Partial<ExternalInvoice>[]) => {
     const repo = AppDataSource.getRepository(ExternalInvoice);
     const queryRunner = AppDataSource.createQueryRunner();
 
@@ -225,12 +270,17 @@ export const getAllExternalInvoices = async (
     page = 1,
     limit = 10,
     search = "",
+    from?: string,
+    to?: string,
+    status?: string,
+    sortBy: 'createdAt' | 'billingMonth' | 'amount' = 'createdAt',
+    sortDir: 'ASC' | 'DESC' = 'DESC',
     includeDeleted = false
 ) => {
     const externalInvoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
     const qb = externalInvoiceRepo.createQueryBuilder("externalInvoice")
-        .orderBy("externalInvoice.createdAt", "DESC")
+        .orderBy(`externalInvoice.${sortBy}`, sortDir)
         .skip((page - 1) * limit)
         .take(limit);
 
@@ -250,11 +300,32 @@ export const getAllExternalInvoices = async (
         );
     }
 
+    // Date range filter on billingMonth
+    if (from && to) {
+        qb.andWhere("externalInvoice.billingMonth BETWEEN :from AND :to", {
+            from: from,
+            to: to,
+        });
+    } else if (from) {
+        qb.andWhere("externalInvoice.billingMonth >= :from", { from });
+    } else if (to) {
+        qb.andWhere("externalInvoice.billingMonth <= :to", { to });
+    }
+
+    // Status filter
+    if (status && status !== 'all') {
+        qb.andWhere("externalInvoice.status = :status", { status });
+    }
+
     // Fetch paginated results
     const [data, total] = await qb.getManyAndCount();
 
     // 🔢 Get Metrics (non-paginated query for totals)
     const baseQb = externalInvoiceRepo.createQueryBuilder("externalInvoice");
+
+    if (!includeDeleted) {
+        baseQb.andWhere("externalInvoice.deletedAt IS NULL");
+    }
 
     if (search) {
         baseQb.andWhere(
@@ -264,6 +335,21 @@ export const getAllExternalInvoices = async (
                 id: isNaN(Number(search)) ? 0 : Number(search),
             }
         );
+    }
+
+    if (from && to) {
+        baseQb.andWhere("externalInvoice.billingMonth BETWEEN :from AND :to", {
+            from: from,
+            to: to,
+        });
+    } else if (from) {
+        baseQb.andWhere("externalInvoice.billingMonth >= :from", { from });
+    } else if (to) {
+        baseQb.andWhere("externalInvoice.billingMonth <= :to", { to });
+    }
+
+    if (status && status !== 'all') {
+        baseQb.andWhere("externalInvoice.status = :status", { status });
     }
 
     const totalPaid = await baseQb
@@ -392,4 +478,97 @@ export const recoverExternalInvoice = async (invoiceId: number, username?: strin
     });
 
     return invoice;
+};
+
+// Collected metrics and drilldowns
+export const getCollectedMetrics = async (dateFrom?: string, dateTo?: string) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const qb = repo.createQueryBuilder('ext')
+        .where('ext.collectedBy IS NOT NULL')
+        .andWhere('ext.deletedAt IS NULL');
+
+    if (dateFrom && dateTo) {
+        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
+            from: new Date(dateFrom),
+            to: new Date(dateTo)
+        });
+    } else if (dateFrom) {
+        qb.andWhere('ext.collectedAt >= :from', { from: new Date(dateFrom) });
+    } else if (dateTo) {
+        qb.andWhere('ext.collectedAt <= :to', { to: new Date(dateTo) });
+    }
+
+    const totalCollectedInvoices = await qb.clone().getCount();
+    const { sum } = await qb.clone()
+        .select('SUM(ext.amount)', 'sum')
+        .getRawOne<{ sum: string }>() || { sum: '0' };
+
+    return { totalCollectedInvoices, totalCashCollected: parseFloat(sum || '0') };
+};
+
+export const getCollectorBreakdown = async (dateFrom?: string, dateTo?: string) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const qb = repo.createQueryBuilder('ext')
+        .select('ext.collectedBy', 'collector')
+        .addSelect('COUNT(*)', 'count')
+        .addSelect('SUM(ext.amount)', 'totalAmount')
+        .where('ext.collectedBy IS NOT NULL')
+        .andWhere('ext.deletedAt IS NULL')
+        .groupBy('ext.collectedBy')
+        .orderBy('totalAmount', 'DESC');
+
+    if (dateFrom && dateTo) {
+        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
+            from: new Date(dateFrom),
+            to: new Date(dateTo)
+        });
+    } else if (dateFrom) {
+        qb.andWhere('ext.collectedAt >= :from', { from: new Date(dateFrom) });
+    } else if (dateTo) {
+        qb.andWhere('ext.collectedAt <= :to', { to: new Date(dateTo) });
+    }
+
+    const rows = await qb.getRawMany<{ collector: string; count: string; totalAmount: string }>();
+    return rows.map(r => ({
+        collector: r.collector,
+        count: parseInt(r.count, 10) || 0,
+        totalAmount: parseFloat(r.totalAmount || '0')
+    }));
+};
+
+export const getCollectedInvoicesList = async (
+    page = 1,
+    limit = 10,
+    dateFrom?: string,
+    dateTo?: string
+) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const qb = repo.createQueryBuilder('ext')
+        .where('ext.collectedBy IS NOT NULL')
+        .andWhere('ext.deletedAt IS NULL')
+        .orderBy('ext.collectedAt', 'DESC')
+        .skip((page - 1) * limit)
+        .take(limit);
+
+    if (dateFrom && dateTo) {
+        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
+            from: new Date(dateFrom),
+            to: new Date(dateTo)
+        });
+    } else if (dateFrom) {
+        qb.andWhere('ext.collectedAt >= :from', { from: new Date(dateFrom) });
+    } else if (dateTo) {
+        qb.andWhere('ext.collectedAt <= :to', { to: new Date(dateTo) });
+    }
+
+    const [data, total] = await qb.getManyAndCount();
+    const totalAmount = data.reduce((acc, inv) => acc + (inv.amount || 0), 0);
+
+    return {
+        data,
+        total,
+        page,
+        totalPages: Math.ceil(total / limit),
+        pageTotalAmount: totalAmount
+    };
 };
