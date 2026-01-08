@@ -36,14 +36,16 @@ export class BandwidthService {
   private username: string;
   private password: string;
   private apiPort: number;
+  private monitorInterface: string;
   private conn: any; // RouterOSAPI instance or null in mock mode
   private readonly mockMode: boolean;
 
   constructor() {
-    this.routerIP = process.env.MIKROTIK_IP || '172.8.16.2';
+    this.routerIP = process.env.MIKROTIK_IP || '172.9.16.2';
     this.username = process.env.MIKROTIK_USERNAME || 'apiuser';
     this.password = process.env.MIKROTIK_PASSWORD || '123456';
     this.apiPort = parseInt(process.env.MIKROTIK_API_PORT || '8728');
+    this.monitorInterface = process.env.MIKROTIK_MONITOR_INTERFACE || 'ether6-OUT';
 
     this.mockMode = !RouterOSAPI;
 
@@ -114,34 +116,71 @@ export class BandwidthService {
 
     await this.ensureConnection();
 
-    const interfaces = await this.conn.write('/interface/print');
-    const data: BandwidthData[] = [];
+    // We only care about one interface (default: ether6-OUT).
+    // /interface/monitor-traffic returns *rates* (packets/sec, bits/sec), not cumulative bytes.
+    const ifaceName = this.monitorInterface || 'ether6-OUT';
 
-    for (const iface of interfaces) {
-      if (iface.type === 'ether' || iface.type === 'wlan' || iface.type === 'bridge') {
-        // RouterOS returns live traffic with /interface/monitor-traffic once=yes
-        const stats = await this.conn.write('/interface/monitor-traffic', [
-          `=interface=${iface.name}`,
-          '=once=yes'
-        ]).catch(() => []);
-        if (stats.length) {
-          const s = stats[0];
-          const rxBits = parseInt(s['rx-bits-per-second'] || s['rx-bps'] || '0');
-          const txBits = parseInt(s['tx-bits-per-second'] || s['tx-bps'] || '0');
-          data.push({
-            interface: iface.name,
-            rxByte: parseInt(s['rx-byte'] || s['rx-bytes'] || '0'),
-            txByte: parseInt(s['tx-byte'] || s['tx-bytes'] || '0'),
-            rxPacket: parseInt(s['rx-packet'] || s['rx-packets'] || '0'),
-            txPacket: parseInt(s['tx-packet'] || s['tx-packets'] || '0'),
-            rxRate: rxBits / 8, // convert bits/sec -> bytes/sec
-            txRate: txBits / 8,
-            timestamp: new Date()
-          });
-        }
+    const stats = await this.conn.write('/interface/monitor-traffic', [
+      `=interface=${ifaceName}`,
+      '=once=yes',
+    ]).catch(() => []);
+
+    if (!stats.length) return [];
+    const s = stats[0];
+
+    // Parse RouterOS rate strings like "17.7Mbps", "0bps", "11 117"
+    // We return Mbps (number) because UI only needs Mbps.
+    const parseRateToMbps = (value: any): number => {
+      if (value === null || value === undefined) return 0;
+      if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+      const raw = String(value).trim();
+      if (!raw) return 0;
+      const s0 = raw.replace(/\s+/g, '');
+      const m = /^([0-9]*\.?[0-9]+)([kKmMgGtT]?)(?:b(?:it)?s)?(?:\/s)?(?:ps)?$/i.exec(s0);
+      if (!m) {
+        const n = Number.parseFloat(s0);
+        return Number.isFinite(n) ? n : 0;
       }
-    }
-    return data;
+      const num = Number.parseFloat(m[1]);
+      if (!Number.isFinite(num)) return 0;
+      const unit = (m[2] || '').toUpperCase();
+      // interpret value as bits per second with unit suffix, convert to Mbps
+      // K -> Kbps, M -> Mbps, G -> Gbps, T -> Tbps, '' -> bps
+      const bps =
+        unit === 'K' ? num * 1e3 :
+        unit === 'M' ? num * 1e6 :
+        unit === 'G' ? num * 1e9 :
+        unit === 'T' ? num * 1e12 :
+        num;
+      return bps / 1e6;
+    };
+
+    const downloadMbps = parseRateToMbps(
+      s['fp-rx-bits-per-second'] ?? s['rx-bits-per-second'] ?? s['rx-bps'] ?? 0
+    );
+    const uploadMbps = parseRateToMbps(
+      s['tx-bits-per-second'] ?? s['tx-bps'] ?? s['fp-tx-bits-per-second'] ?? 0
+    );
+
+    // packets/sec are plain numbers (may contain spaces)
+    const rxPacketsPerSec = Number.parseFloat(String(s['rx-packets-per-second'] ?? '0').replace(/\s+/g, '')) || 0;
+    const txPacketsPerSec = Number.parseFloat(String(s['tx-packets-per-second'] ?? '0').replace(/\s+/g, '')) || 0;
+
+    return [
+      {
+        interface: ifaceName,
+        // monitor-traffic doesn't provide cumulative bytes; keep 0 for now
+        rxByte: 0,
+        txByte: 0,
+        // packets per second
+        rxPacket: Math.floor(rxPacketsPerSec),
+        txPacket: Math.floor(txPacketsPerSec),
+        // Mbps (download/upload)
+        rxRate: downloadMbps,
+        txRate: uploadMbps,
+        timestamp: new Date(),
+      },
+    ];
   }
 
   /* ------------------------------------------------------------------
@@ -216,7 +255,7 @@ export class BandwidthService {
    * ------------------------------------------------------------------*/
   private generateMockInterfaceTraffic(): BandwidthData[] {
     logger.debug('Generating mock interface stats');
-    return [...this.generateMockEth('ether1'), ...this.generateMockEth('ether2'), ...this.generateMockEth('wlan1')];
+    return [this.generateMockEth(this.monitorInterface || 'ether6-OUT')[0]];
   }
 
   private generateMockEth(name: string): BandwidthData[] {
@@ -226,8 +265,9 @@ export class BandwidthService {
       txByte: Math.floor(Math.random() * 2_000_000) + 300_000,
       rxPacket: Math.floor(Math.random() * 4_000) + 800,
       txPacket: Math.floor(Math.random() * 2_500) + 400,
-      rxRate: Math.floor(Math.random() * 1500) + 300,
-      txRate: Math.floor(Math.random() * 800) + 150,
+      // bits/sec
+      rxRate: (Math.random() * 200 + 10) * 1_000_000, // 10–210 Mbps
+      txRate: (Math.random() * 800 + 50) * 1_000_000, // 50–850 Mbps
       timestamp: new Date()
     }];
   }

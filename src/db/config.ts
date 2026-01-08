@@ -24,6 +24,7 @@ import { SystemUsers } from './entities/SystemUsers';
 import { TimeRestrictions } from './entities/TimeRestrictions';
 import { UserDetails } from './entities/UserDetails';
 import { UserMac } from './entities/UserMac';
+import { Expense } from './entities/Expense';
 
 // Create entities array with explicit references
 const entities = [
@@ -47,7 +48,8 @@ const entities = [
     SystemUsers,
     TimeRestrictions,
     UserDetails,
-    UserMac
+    UserMac,
+    Expense
 ];
 
 export const AppDataSource = new DataSource({

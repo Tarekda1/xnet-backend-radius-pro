@@ -112,7 +112,7 @@ export class BandwidthController {
       ]);
 
       // Calculate bandwidth utilization percentages
-      const totalBandwidth = 1000000000; // 1 Gbps in bits per second
+      const totalBandwidth = 1000; // 1 Gbps in Mbps (rxRate/txRate are Mbps)
       const rxUtilization = (summary.totalRxRate / totalBandwidth) * 100;
       const txUtilization = (summary.totalTxRate / totalBandwidth) * 100;
 

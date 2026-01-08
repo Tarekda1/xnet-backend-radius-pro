@@ -27,6 +27,7 @@ import { WebSocketServer } from 'ws';
 import invoiceRoutes from './routes/invoiceRoutes';
 import alertRoutes from './routes/alertRoutes';
 import bandwidthRoutes from './routes/bandwidthRoutes';
+import expenseRoutes from './routes/expenseRoutes';
 import './events/invoiceListeners'
 import cors from 'cors';
 import eventBus from './bus/eventBusSingleton';
@@ -112,6 +113,8 @@ app.use("/api/invoices", invoiceRoutes);
 app.use("/api/alerts", alertRoutes);
 
 app.use("/api/bandwidth", bandwidthRoutes);
+
+app.use("/api/expenses", expenseRoutes);
 
 cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
