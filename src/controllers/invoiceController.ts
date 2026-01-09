@@ -6,6 +6,7 @@ import {
   payInvoice, payExternalInvoice, replaceExternalInvoices,
   updateExternalInvoice,
   deleteExternalInvoice,
+  bulkDeleteExternalInvoices,
   collectInvoice,
   reconcileInvoiceCash,
   getCollectedMetrics,
@@ -314,6 +315,21 @@ export const deleteExternalInvoiceHandler = async (req: Request, res: Response) 
   } catch (error) {
     console.error("Error deleting external invoice:", error);
     res.status(500).json({ message: "Failed to delete external invoice" });
+  }
+};
+
+export const bulkDeleteExternalInvoicesHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceIds = req.body?.invoiceIds;
+    if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+      return sendResponse(res, false, 400, "invoiceIds must be a non-empty array");
+    }
+
+    const result = await bulkDeleteExternalInvoices(invoiceIds, req.user?.username);
+    sendResponse(res, true, 200, "External invoices deleted successfully", result);
+  } catch (error) {
+    console.error("Error bulk deleting external invoices:", error);
+    res.status(500).json({ message: "Failed to delete external invoices" });
   }
 };
 

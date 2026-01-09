@@ -1,5 +1,6 @@
 // src/services/invoice.service.ts
 import { AppDataSource } from '../db/config';
+import { In } from 'typeorm';
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Invoices } from "../db/entities/Invoices";
 import { startOfMonth } from "date-fns";
@@ -445,6 +446,52 @@ export const deleteExternalInvoice = async (invoiceId: number, username?: string
     });
 
     return invoice;
+};
+
+export const bulkDeleteExternalInvoices = async (invoiceIds: number[], username?: string) => {
+    const externalInvoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+
+    const uniqueIds = Array.from(new Set(invoiceIds))
+        .map((x) => Number(x))
+        .filter((x) => Number.isFinite(x) && x > 0);
+
+    if (uniqueIds.length === 0) {
+        return { deletedIds: [], failed: [] as Array<{ id: number; reason: string }> };
+    }
+
+    // Only non-deleted records will be returned by default; already-deleted IDs will be treated as "not found"
+    const invoices = await externalInvoiceRepo.find({
+        where: { id: In(uniqueIds) as any },
+    });
+
+    const foundIds = new Set(invoices.map((i) => i.id).filter(Boolean) as number[]);
+    const failed: Array<{ id: number; reason: string }> = [];
+    for (const id of uniqueIds) {
+        if (!foundIds.has(id)) {
+            failed.push({ id, reason: 'Invoice not found (or already deleted)' });
+        }
+    }
+
+    // Soft-delete everything found and stamp deletedBy
+    for (const inv of invoices) {
+        inv.deletedBy = username || 'system';
+    }
+
+    if (invoices.length > 0) {
+        await externalInvoiceRepo.softRemove(invoices);
+
+        for (const inv of invoices) {
+            invoiceEvents.emitModification({
+                invoiceId: inv.id || -1,
+                username: username || 'system',
+                action: 'DELETED',
+                timestamp: new Date(),
+            });
+        }
+    }
+
+    const deletedIds = invoices.map((i) => i.id).filter(Boolean) as number[];
+    return { deletedIds, failed };
 };
 
 
