@@ -5,6 +5,7 @@ services:
     restart: always
     ports:
       - "3000:3000"
+    stop_grace_period: 30s
     env_file:
       - .env
     environment:
@@ -18,6 +19,8 @@ services:
       WHATSAPP_TEMPLATE_LANGUAGE_CODE: "en_US"
       TWILIO_CONTENT_SID: "HX2b1c610a6367c55059c95190739d9dc8"
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672"
+      # Better logs for Loki (JSON + requestId fields)
+      LOG_FORMAT: "json"
     volumes:
       - .:/app
     depends_on:
@@ -25,6 +28,62 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3000/api/ready',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - backend_network
+
+  prometheus:
+    image: quay.io/prometheus/prometheus:v2.55.1
+    container_name: xnet-prometheus
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+      prometheus-config:
+        condition: service_completed_successfully
+    environment:
+      # REQUIRED: set this in your .env
+      - PROM_REMOTE_WRITE_URL=${PROM_REMOTE_WRITE_URL}
+    volumes:
+      - prometheus_config:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - backend_network
+
+  prometheus-config:
+    image: busybox:1.36
+    container_name: xnet-prometheus-config
+    restart: "no"
+    environment:
+      - PROM_REMOTE_WRITE_URL=${PROM_REMOTE_WRITE_URL}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ -z "$PROM_REMOTE_WRITE_URL" ]; then
+          echo "PROM_REMOTE_WRITE_URL is required" >&2
+          exit 1
+        fi
+        mkdir -p /out
+        sed "s|__PROM_REMOTE_WRITE_URL__|$PROM_REMOTE_WRITE_URL|g" /tmpl/prometheus.yml.tmpl > /out/prometheus.yml
+        cp /tmpl/alerts.yml /out/alerts.yml
+    volumes:
+      - ./observability/prometheus/prometheus.yml.tmpl:/tmpl/prometheus.yml.tmpl:ro
+      - ./observability/prometheus/alerts.yml:/tmpl/alerts.yml:ro
+      - prometheus_config:/out
     networks:
       - backend_network
   
@@ -73,6 +132,56 @@ services:
       retries: 5
       start_period: 40s
 
+  loki:
+    image: grafana/loki:3.5.7
+    container_name: xnet-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - backend_network
+
+  promtail:
+    image: grafana/promtail:3.5.7
+    container_name: xnet-promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+      # Linux host: default /var/run/docker.sock
+      # Windows Docker Desktop: set DOCKER_SOCK=//./pipe/docker_engine in .env
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - backend_network
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: xnet-grafana
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3001:3000"
+    networks:
+      - backend_network
+
 networks:
   backend_network:
     driver: bridge
@@ -80,3 +189,7 @@ networks:
 volumes:
   redis_data:
   node_modules_volume:
+  prometheus_data:
+  prometheus_config:
+  loki_data:
+  grafana_data:

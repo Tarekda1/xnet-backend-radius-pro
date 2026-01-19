@@ -6,6 +6,7 @@ import {
   PrimaryGeneratedColumn,
 } from "typeorm";
 import { RefreshTokens } from "./RefreshTokens";
+import { UserPermissionOverride } from "./UserPermissionOverride";
 
 @Index("username", ["username"], { unique: true })
 @Index("email", ["email"], { unique: true })
@@ -25,13 +26,27 @@ export class SystemUsers {
   @Column("varchar", { name: "password", length: 255 })
   password: string;
 
+  @Column("tinyint", {
+    name: "must_change_password",
+    nullable: true,
+    width: 1,
+    default: () => "'0'",
+  })
+  mustChangePassword: boolean | null;
+
+  @Column("timestamp", { name: "password_changed_at", nullable: true })
+  passwordChangedAt: Date | null;
+
   @Column("enum", {
     name: "role",
     nullable: true,
-    enum: ["admin", "manager", "support", "collector"],
+    enum: ["admin", "manager", "support", "collector", "reseller"],
     default: 'support',
   })
-  role: "admin" | "manager" | "support" | "collector" | null;
+  role: "admin" | "manager" | "support" | "collector" | "reseller" | null;
+
+  @Column("int", { name: "reseller_id", nullable: true })
+  resellerId: number | null;
 
   @Column("tinyint", {
     name: "is_active",
@@ -60,4 +75,7 @@ export class SystemUsers {
 
   @OneToMany(() => RefreshTokens, (refreshTokens) => refreshTokens.user)
   refreshTokens: RefreshTokens[];
+
+  @OneToMany(() => UserPermissionOverride, (o) => o.user)
+  permissionOverrides: UserPermissionOverride[];
 }

@@ -7,6 +7,32 @@ import { Logs } from '../db/entities/Logs'; // Adjust the path as needed
 import { TypeOrmTransport } from './TypeormTransport';
 import { AppDataSource } from '../db/config';
 
+function isJsonLoggingEnabled() {
+  const v = String(process.env.LOG_FORMAT || "").toLowerCase();
+  if (v === "json") return true;
+  // default to JSON logs in production so Loki parsing is clean
+  return process.env.NODE_ENV === "production";
+}
+
+function baseFormat() {
+  if (isJsonLoggingEnabled()) {
+    return winston.format.combine(
+      winston.format.timestamp(),
+      winston.format.errors({ stack: true }),
+      winston.format.json()
+    );
+  }
+
+  return winston.format.combine(
+    winston.format.colorize(),
+    winston.format.timestamp(),
+    winston.format.printf((info) => {
+      const msg = info.message ?? "";
+      return `${info.timestamp} ${info.level}: ${msg}`;
+    })
+  );
+}
+
 class Logger {
   private static instance: winston.Logger;
 
@@ -30,10 +56,7 @@ class Logger {
 
     return winston.createLogger({
       level: params?.level || 'info',
-      format: params?.format || winston.format.combine(
-        winston.format.colorize(),
-        winston.format.json()
-      ),
+      format: params?.format || baseFormat(),
       transports: baseTransports
     });
   }
@@ -61,7 +84,11 @@ class Logger {
 // Middleware to log all requests using the singleton logger instance
 export function requestLogger(req: Request, res: Response, next: NextFunction) {
   const log = Logger.getInstance();
-  log.info(`Incoming request: ${req.method} ${req.url}`);
+  log.info('Incoming request', {
+    requestId: (req as any).requestId,
+    method: req.method,
+    url: req.url,
+  });
   next();
 }
 
@@ -72,10 +99,12 @@ export const loggerMiddleware = expressWinston.logger({
     new winston.transports.File({ filename: 'combined.log' })
     // DB transport will be added dynamically once DataSource is ready
   ],
-  format: winston.format.combine(
-    winston.format.colorize(),
-    winston.format.json()
-  )
+  format: baseFormat(),
+  dynamicMeta: (req) => ({
+    requestId: (req as any).requestId,
+  }),
+  // keep express-winston message consistent
+  msg: "HTTP {{req.method}} {{req.url}}",
 });
 
 export { Logger };

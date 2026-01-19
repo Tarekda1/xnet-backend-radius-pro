@@ -25,6 +25,11 @@ import { TimeRestrictions } from './entities/TimeRestrictions';
 import { UserDetails } from './entities/UserDetails';
 import { UserMac } from './entities/UserMac';
 import { Expense } from './entities/Expense';
+import { Role } from './entities/Role';
+import { RolePermission } from './entities/RolePermission';
+import { UserPermissionOverride } from './entities/UserPermissionOverride';
+import { Reseller } from './entities/Reseller';
+import { ResellerLedgerEntry } from './entities/ResellerLedgerEntry';
 
 // Create entities array with explicit references
 const entities = [
@@ -43,12 +48,17 @@ const entities = [
     Radusagestats,
     Raduserprofile,
     RefreshTokens,
+    Role,
+    RolePermission,
+    Reseller,
+    ResellerLedgerEntry,
     SessionTracking,
     Settings,
     SystemUsers,
     TimeRestrictions,
     UserDetails,
     UserMac,
+    UserPermissionOverride,
     Expense
 ];
 

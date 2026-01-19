@@ -21,6 +21,13 @@ const sendResponse = (res: Response, success: boolean, status: number, message: 
     res.status(status).json({ success, message, data });
 };
 
+function getResellerFilter(req: Request): { isReseller: boolean; resellerId: number | null } {
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    return { isReseller: role === "reseller" && !!resellerId, resellerId };
+}
+
 const deleteCacheKeys = async () => {
     try {
         // Patterns to match different types of user caches
@@ -55,7 +62,14 @@ const deleteCacheKeys = async () => {
 function formatUsersWithStatus(entities: any, raw: any) {
     return entities.map((user: any, index: number) => ({
         ...user,
-        isOnline: raw[index].session_id !== null,
+        // TypeORM raw values may be boolean/number/string depending on driver
+        isOnline: raw[index].isOnline === true || raw[index].isOnline === 1 || raw[index].isOnline === "1",
+        // TypeORM raw aliases can vary depending on driver/casing; accept common shapes
+        lastTimeActive:
+            raw[index].lastTimeActive ??
+            raw[index].lasttimeactive ??
+            raw[index].last_time_active ??
+            null,
     }));
 }
 
@@ -64,6 +78,7 @@ export const UserController = {
     quotaService: new QuotaService(AppDataSource, eventBus, new CacheService()),
     getRadUsers: async (req: Request, res: Response) => {
         try {
+            const { isReseller, resellerId } = getResellerFilter(req);
             // 🔹 Get pagination parameters
             let page = parseInt(req.query.page as string) || 1;
             let limit = parseInt(req.query.pageSize as string) || 10;
@@ -71,8 +86,9 @@ export const UserController = {
             if (limit < 1) limit = 10;
             const offset = (page - 1) * limit;
 
-            const cacheKey = `users_page_${page}_limit_${limit}`;
-            const statusCacheKey = `users_status_${page}_limit_${limit}`;
+            const scope = isReseller ? `reseller_${resellerId}` : "global";
+            const cacheKey = `users_page_${scope}_${page}_limit_${limit}`;
+            const statusCacheKey = `users_status_${scope}_${page}_limit_${limit}`;
 
             // 🔹 Check Redis cache for user data
             const cachedResponse = await redisClient.get(cacheKey);
@@ -87,7 +103,14 @@ export const UserController = {
                     ...userData,
                     users: userData.users.map((user: any) => ({
                         ...user,
-                        isOnline: statusData[user.username] || false
+                        isOnline:
+                          typeof statusData[user.username] === "object"
+                            ? !!statusData[user.username]?.isOnline
+                            : !!statusData[user.username],
+                        lastTimeActive:
+                          typeof statusData[user.username] === "object"
+                            ? (statusData[user.username]?.lastTimeActive ?? user.lastTimeActive ?? null)
+                            : (user.lastTimeActive ?? null),
                     }))
                 };
                 
@@ -97,12 +120,13 @@ export const UserController = {
             const userRepository = AppDataSource.getRepository(Raduserprofile);
 
             // 🔹 Count total users for pagination
-            const totalUsers = await userRepository
-                .createQueryBuilder("user")
-                .getCount();
+            const totalUsersQb = userRepository.createQueryBuilder("user");
+            if (isReseller) totalUsersQb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
+            const totalUsers = await totalUsersQb.getCount();
 
             // 🔹 Fetch users with profile relation and left join UserMac
-            const { entities, raw } = await userRepository
+            const onlineGraceSeconds = Number(process.env.ONLINE_GRACE_SECONDS ?? 120);
+            const qb = userRepository
                 .createQueryBuilder("user")
                 .leftJoinAndSelect("user.profile", "profile")
                 .leftJoinAndMapOne(
@@ -123,11 +147,33 @@ export const UserController = {
                     "userDetails",
                     "user.username = userDetails.username"
                 )
-                .leftJoinAndMapOne(
-                    "user.session",
-                    SessionTracking,
-                    "session",
-                    "user.username = session.username AND session.status = 'active'"
+                .leftJoin(
+                    (qb) =>
+                        qb
+                            .from(SessionTracking, "st")
+                            .select([
+                                "st.username AS st_username",
+                                // User-requested online flag: any active session with end_time IS NULL
+                                "MAX(CASE WHEN st.end_time IS NULL THEN 1 ELSE 0 END) AS has_open_active_session",
+                                // Optional freshness signal (used only for last active / debugging)
+                                "MAX(COALESCE(st.last_update, st.start_time)) AS last_active_ping",
+                            ])
+                            .where("st.status = 'active'")
+                            .groupBy("st.username"),
+                    "activeSess",
+                    "user.username = activeSess.st_username"
+                )
+                .leftJoin(
+                    (qb) =>
+                        qb
+                            .from(SessionTracking, "st2")
+                            .select([
+                                "st2.username AS la_username",
+                                "MAX(COALESCE(st2.last_update, st2.end_time, st2.start_time)) AS last_time_active",
+                            ])
+                            .groupBy("st2.username"),
+                    "lastActive",
+                    "user.username = lastActive.la_username"
                 )
                 .select([
                     "user.id",
@@ -149,13 +195,23 @@ export const UserController = {
                     "userDetails.address",
                     "userDetails.phoneNumber",
                     "userDetails.email",
-                    "session.id"
                 ])
-                .addSelect("session.id IS NOT NULL", "isOnline")
+                .addSelect(
+                    // Online rule requested: open active session (end_time IS NULL)
+                    "CASE WHEN COALESCE(activeSess.has_open_active_session, 0) = 1 THEN true ELSE false END",
+                    "isOnline"
+                )
+                .addSelect("lastActive.last_time_active", "lastTimeActive")
                 .orderBy("user.id", "ASC")
                 .limit(limit)
                 .offset(offset)
-                .getRawAndEntities();
+                .setParameters({ onlineGrace: onlineGraceSeconds })
+            
+            if (isReseller) {
+                qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
+            }
+
+            const { entities, raw } = await qb.getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);
 
@@ -165,7 +221,7 @@ export const UserController = {
 
             // Create a status map for caching
             const statusMap = users.reduce((acc: any, user: any) => {
-                acc[user.username] = user.isOnline;
+                acc[user.username] = { isOnline: user.isOnline, lastTimeActive: (user as any).lastTimeActive ?? null };
                 return acc;
             }, {});
 
@@ -464,6 +520,7 @@ export const UserController = {
     searchUsers: async (req: Request, res: Response) => {
         try {
             const { query } = req.query;
+            const { isReseller, resellerId } = getResellerFilter(req);
 
             console.log('Received search query:', query);
 
@@ -473,7 +530,7 @@ export const UserController = {
 
             const userRepository = AppDataSource.getRepository(Raduserprofile);
 
-            const { entities, raw } = await userRepository
+            const qb = userRepository
                 .createQueryBuilder("user")
                 .leftJoinAndSelect("user.profile", "profile")
                 .leftJoinAndMapOne(
@@ -495,14 +552,44 @@ export const UserController = {
                     "user.username = userDetails.username"
                 )
                 .leftJoin(
-                    SessionTracking,
-                    "session",
-                    "user.username = session.username AND session.status = 'active'"
+                    (qb) =>
+                        qb
+                            .from(SessionTracking, "st")
+                            .select([
+                                "st.username AS st_username",
+                                "MAX(CASE WHEN st.end_time IS NULL THEN 1 ELSE 0 END) AS has_open_active_session",
+                                "MAX(COALESCE(st.last_update, st.start_time)) AS last_active_ping",
+                            ])
+                            .where("st.status = 'active'")
+                            .groupBy("st.username"),
+                    "activeSess",
+                    "user.username = activeSess.st_username"
                 )
-                .addSelect(`CASE WHEN session.id IS NOT NULL THEN true ELSE false END`, "isOnline")
+                .leftJoin(
+                    (qb) =>
+                        qb
+                            .from(SessionTracking, "st2")
+                            .select([
+                                "st2.username AS la_username",
+                                "MAX(COALESCE(st2.last_update, st2.end_time, st2.start_time)) AS last_time_active",
+                            ])
+                            .groupBy("st2.username"),
+                    "lastActive",
+                    "user.username = lastActive.la_username"
+                )
+                .addSelect(
+                    "CASE WHEN COALESCE(activeSess.has_open_active_session, 0) = 1 THEN true ELSE false END",
+                    "isOnline"
+                )
+                .addSelect("lastActive.last_time_active", "lastTimeActive")
                 .where("user.username LIKE :query", { query: `%${query}%` })
                 .orWhere("userDetails.email LIKE :query", { query: `%${query}%` })
                 .orWhere("userDetails.fullName LIKE :query", { query: `%${query}%` })
+            
+            // Apply reseller scoping (this will become (A OR B OR C) AND owner_reseller_id = rid)
+            if (isReseller) qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
+
+            const { entities, raw } = await qb
                 .select([
                     "user.id",
                     "user.username",
@@ -511,6 +598,7 @@ export const UserController = {
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
                     "user.accountStatus",
+                    "user.ownerResellerId",
                     "profile.id",
                     "profile.profileName",
                     "profile.dailyQuota",
@@ -523,9 +611,9 @@ export const UserController = {
                     "userDetails.address",
                     "userDetails.phoneNumber",
                     "userDetails.email",
-                    "session.id",
                 ])
                 .orderBy("user.id", "ASC")
+                .setParameters({ onlineGrace: Number(process.env.ONLINE_GRACE_SECONDS ?? 120) })
                 .getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);

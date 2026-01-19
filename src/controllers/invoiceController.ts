@@ -9,9 +9,11 @@ import {
   bulkDeleteExternalInvoices,
   collectInvoice,
   reconcileInvoiceCash,
+  reconcileBulkCash,
   getCollectedMetrics,
   getCollectorBreakdown,
-  getCollectedInvoicesList
+  getCollectedInvoicesList,
+  unpayExternalInvoice
 } from "../services/invoiceService";
 import * as XLSX from "xlsx";
 import fs from "fs";
@@ -159,8 +161,9 @@ export const reconcileInvoiceCashHandler = async (req: Request, res: Response) =
       return sendResponse(res, false, 400, "Invalid invoice ID");
     }
     const username = req.user?.username || 'system';
+    const role = req.user?.role as any;
 
-    const invoice = await reconcileInvoiceCash(invoiceId, username);
+    const invoice = await reconcileInvoiceCash(invoiceId, username, role);
 
     await invoiceEvents.emitModification({
       invoiceId: invoice.id || -1,
@@ -172,7 +175,58 @@ export const reconcileInvoiceCashHandler = async (req: Request, res: Response) =
     sendResponse(res, true, 200, "Invoice cash reconciled", invoice);
   } catch (error) {
     console.error("Error reconciling invoice:", error);
+    const message = (error as any)?.message || "Failed to reconcile invoice";
+    if (message === 'Forbidden') return sendResponse(res, false, 403, "Forbidden");
+    if (message.startsWith('Invalid') || message.startsWith('Only') || message.startsWith('Invoice is')) {
+      return sendResponse(res, false, 400, message);
+    }
     res.status(500).json({ message: "Failed to reconcile invoice" });
+  }
+};
+
+export const reconcileBulkCashHandler = async (req: Request, res: Response) => {
+  try {
+    const { dateFrom, dateTo, collector } = (req.body || {}) as {
+      dateFrom?: string;
+      dateTo?: string;
+      collector?: string;
+    };
+
+    if (!dateFrom || !dateTo) {
+      return sendResponse(res, false, 400, "dateFrom and dateTo are required");
+    }
+
+    const actorUsername = req.user?.username || 'system';
+    const role = req.user?.role as any;
+
+    const effectiveCollector =
+      role === 'collector' ? actorUsername : (collector || undefined);
+
+    const result = await reconcileBulkCash({
+      dateFrom,
+      dateTo,
+      collector: effectiveCollector,
+      actorUsername,
+    });
+
+    for (const id of result.reconciledIds) {
+      invoiceEvents.emitModification({
+        invoiceId: id,
+        username: actorUsername,
+        action: 'RECONCILED',
+        timestamp: new Date(),
+        data: { bulk: true },
+      });
+    }
+
+    sendResponse(res, true, 200, "Bulk cash reconciliation completed", result);
+  } catch (error) {
+    console.error("Error bulk reconciling cash:", error);
+    const message = (error as any)?.message || "Failed to bulk reconcile cash";
+    if (message.startsWith('Invalid') || message.startsWith('dateFrom')) {
+      return sendResponse(res, false, 400, message);
+    }
+    res.status(500).json({ message: "Failed to bulk reconcile cash" });
   }
 };
 
@@ -409,6 +463,33 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
   } catch (error) {
     console.error("Error paying invoice:", error);
     res.status(500).json({ message: "Failed to pay invoice" });
+  }
+};
+
+export const unpayExternalInvoiceHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId);
+    if (isNaN(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+
+    const actor = req.user?.username || 'system';
+    const invoice = await unpayExternalInvoice(invoiceId, actor);
+
+    invoiceEvents.emitModification({
+      invoiceId: invoice.id || -1,
+      username: actor,
+      action: 'UNPAID',
+      timestamp: new Date(),
+      data: invoice,
+    });
+
+    sendResponse(res, true, 200, "Invoice marked as unpaid", invoice);
+  } catch (error) {
+    console.error("Error unpaying external invoice:", error);
+    const message = (error as any)?.message || "Failed to unpay invoice";
+    if (message === 'Invoice not found') return sendResponse(res, false, 404, message);
+    res.status(500).json({ message: "Failed to unpay invoice" });
   }
 };
 

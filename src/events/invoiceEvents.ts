@@ -5,7 +5,7 @@ import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 export interface InvoiceModification {
     invoiceId: number;
     username: string;
-    action: 'UPDATED' | 'DELETED' | 'PAID' | 'RECOVERED' | 'COLLECTED' | 'RECONCILED';
+    action: 'UPDATED' | 'DELETED' | 'PAID' | 'UNPAID' | 'RECOVERED' | 'COLLECTED' | 'RECONCILED';
     timestamp: Date;
     changes?: Record<string, any>;
     data?: any;

@@ -53,6 +53,9 @@ export class Raduserprofile {
   })
   accountStatus: string | null;
 
+  @Column("int", { name: "owner_reseller_id", nullable: true })
+  ownerResellerId: number | null;
+
   @OneToMany(() => Invoices, (invoices) => invoices.userProfile)
   invoices: Invoices[];
 

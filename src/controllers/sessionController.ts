@@ -15,7 +15,19 @@ export const healthCheck = (req: Request, res: Response) => {
 
 export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
   try {
-    const today = new Date().toISOString().split("T")[0]; // Get today's date in YYYY-MM-DD format
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    const now = new Date();
+    const today = now.toISOString().split("T")[0]; // YYYY-MM-DD
+
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+    const tomorrowStart = new Date(todayStart);
+    tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+
     const firstDayOfMonth = new Date(today);
     firstDayOfMonth.setDate(1); // Get the first day of the month
     const firstDayOfMonthStr = firstDayOfMonth.toISOString().split("T")[0];
@@ -31,16 +43,54 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
     const sessionRepo = AppDataSource.getRepository(SessionTracking);
 
     // 🔹 Count total users for pagination
-    const totalUsers = await sessionRepo
+    const totalQb = sessionRepo
       .createQueryBuilder("session")
-      .where("session.status = :status", { status: "active" })
-      .andWhere("session.startTime >= :today", { today })
-      .getCount();
+      .leftJoin(Raduserprofile, "userProfile", "session.username = userProfile.username")
+      // Join user_details ONLY for filtering; do not select/map it (avoids ONLY_FULL_GROUP_BY issues)
+      .leftJoin(UserDetails, "userDetails", "session.username = userDetails.username")
+      .select("COUNT(DISTINCT session.username)", "cnt")
+      .where("session.status = :status", { status: "active" });
+
+    if (search) {
+      totalQb.andWhere(
+        new Brackets((qb) => {
+          qb.where("LOWER(session.username) LIKE :search", { search: `%${search}%` }).orWhere(
+            "LOWER(userDetails.full_name) LIKE :search",
+            { search: `%${search}%` }
+          );
+        })
+      );
+    }
+
+    if (isReseller) {
+      totalQb.andWhere("userProfile.owner_reseller_id = :rid", { rid: resellerId });
+    }
+
+    const totalUsersRow = await totalQb.getRawOne<{ cnt: string }>();
+
+    const totalUsers = Number(totalUsersRow?.cnt ?? 0);
 
     // 🔹 Query online users with daily & monthly usage
     const users = await sessionRepo
       .createQueryBuilder("session")
       .leftJoinAndSelect(Radusagestats, "usage", "session.username = usage.username AND usage.day = :today", { today })
+      .leftJoin(
+        (qb) =>
+          qb
+            .from(SessionTracking, "du")
+            .select([
+              "du.username AS du_username",
+              "SUM(COALESCE(du.bytes_in, 0) + COALESCE(du.bytes_out, 0)) AS daily_usage",
+            ])
+            // Daily usage definition (per user request):
+            // - only sessions that STARTED today
+            // - and are still open (end_time IS NULL)
+            .where("du.startTime >= :todayStart AND du.startTime < :tomorrowStart")
+            .andWhere("du.endTime IS NULL")
+            .groupBy("du.username"),
+        "dailyUsage",
+        "session.username = dailyUsage.du_username"
+      )
       .leftJoin(qb =>
         qb.from(Radusagestats, "monthlyUsage")
           .select([
@@ -65,9 +115,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         "session.startTime",
         "session.lastUpdate",
         "session.sessionTime",
-        "SUM(session.bytes_in) AS total_bytes_in",
-        "SUM(session.bytes_out) AS total_bytes_out",
-        "SUM(session.bytes_in + session.bytes_out) AS total_daily_usage",
+        "COALESCE(dailyUsage.daily_usage, 0) AS total_daily_usage",
         "COALESCE(usage.data_usage, 0) AS real_time_data_usage",
         "COALESCE(monthlyUsage.monthly_usage, 0) AS monthly_usage",
         "profile.profileName",
@@ -79,18 +127,22 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         "userDetails.fullName",
       ])
       .where("session.status = :status", { status: "active" })
-      .andWhere("session.startTime >= :today", { today })
       .andWhere(new Brackets(qb => {
         qb.where("LOWER(session.username) LIKE :search", { search: `%${search}%` })
           .orWhere("LOWER(userDetails.fullName) LIKE :search", { search: `%${search}%` });
       }))
+      .andWhere(new Brackets((qb) => {
+        if (!isReseller) return;
+        qb.where("userProfile.owner_reseller_id = :rid", { rid: resellerId });
+      }))
       .groupBy(`session.username, session.macAddress, session.status, 
         session.startTime, session.lastUpdate,
-        session.sessionTime,usage.data_usage, monthlyUsage.monthly_usage, 
+        session.sessionTime,usage.data_usage, monthlyUsage.monthly_usage, dailyUsage.daily_usage,
         profile.profileName, profile.dailyQuota, profile.monthlyQuota,userProfile.is_fallback`)
       .orderBy("session.startTime", "DESC") // Optional sorting
       .limit(limit)
       .offset(offset)
+      .setParameters({ todayStart, tomorrowStart })
       .getRawMany();
 
     res.status(200).json({
@@ -109,15 +161,42 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
 };
 
 export const getOnlineUsersMetrics = async (req: Request, res: Response) => {
+  const role = (req.user as any)?.role as string | undefined;
+  const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+  const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+  const isReseller = role === "reseller" && !!resellerId;
 
-  const metrics = await getOnlineUsers();
+  if (!isReseller) {
+    const metrics = await getOnlineUsers();
+    res.status(200).json({
+      success: true,
+      message: "Online users fetched successfully",
+      data: metrics,
+    });
+    return;
+  }
+
+  // Reseller-scoped metrics: count only sessions for reseller-owned users
+  const sessionRepo = AppDataSource.getRepository(SessionTracking);
+  const row = await sessionRepo
+    .createQueryBuilder("s")
+    .leftJoin(Raduserprofile, "u", "s.username = u.username")
+    .select([
+      "COUNT(DISTINCT s.username) AS totalOnlineUsers",
+      "COUNT(DISTINCT CASE WHEN s.status = 'active' THEN s.username END) AS totalActiveUsers",
+    ])
+    .where("s.status = 'active'")
+    .andWhere("u.owner_reseller_id = :rid", { rid: resellerId })
+    .getRawOne<{ totalOnlineUsers: string; totalActiveUsers: string }>();
 
   res.status(200).json({
     success: true,
     message: "Online users fetched successfully",
-    data: metrics,
+    data: {
+      totalOnlineUsers: Number(row?.totalOnlineUsers ?? 0),
+      totalActiveUsers: Number(row?.totalActiveUsers ?? 0),
+    },
   });
-
 };
 
 export const disconnectOnlineUser = async (req: Request, res: Response) => {

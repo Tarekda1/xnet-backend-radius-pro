@@ -8,9 +8,10 @@ import { RefreshTokens } from '../db/entities/RefreshTokens';
 import { AppDataSource } from '../db/config';
 import { body, validationResult } from 'express-validator';
 import { Equal } from 'typeorm';
+import { getEffectivePermissionsForUser } from '../access/permissionService';
 
-const jwtSecret = 'your_jwt_secret';
-const refreshTokenSecret = 'your_refresh_jwt_secret';
+const jwtSecret = process.env.JWT_SECRET || 'your_jwt_secret';
+const refreshTokenSecret = process.env.REFRESH_TOKEN_SECRET || 'your_refresh_jwt_secret';
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
     res.status(status).json({ success, message, data });
@@ -261,15 +262,36 @@ export const login = async (req: Request, res: Response) => {
             return sendResponse(res, false, 401, 'Invalid credentials');
         }
 
-        const accessToken = jwt.sign({ username: user.username, role: user.role }, jwtSecret, { expiresIn: '1Day' });
-        const refreshToken = jwt.sign({ username: user.username }, refreshTokenSecret);
+        const permissions = await getEffectivePermissionsForUser({
+            userId: user.id,
+            username: user.username,
+            roleKey: user.role ?? undefined,
+        });
+
+        const accessToken = jwt.sign(
+            { id: user.id, username: user.username, role: user.role, resellerId: user.resellerId ?? null },
+            jwtSecret,
+            { expiresIn: '1d' }
+        );
+        // Include role in refresh token for compatibility with existing refresh logic
+        const refreshToken = jwt.sign(
+            { id: user.id, username: user.username, role: user.role, resellerId: user.resellerId ?? null },
+            refreshTokenSecret
+        );
 
         const newRefreshToken = refreshTokenRepository.create({ token: refreshToken, user });
         await refreshTokenRepository.save(newRefreshToken);
 
-        console.log(user); // Log the user object to the console
-
-        sendResponse(res, true, 200, 'Login successful', { user, accessToken, refreshToken });
+        const safeUser = {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+            resellerId: user.resellerId ?? null,
+            mustChangePassword: Boolean((user as any).mustChangePassword),
+            permissions,
+        };
+        sendResponse(res, true, 200, 'Login successful', { user: safeUser, accessToken, refreshToken });
     } catch (error) {
         console.log(`err: ${JSON.stringify(error)}`);
         sendResponse(res, false, 500, 'Internal server error');
@@ -314,12 +336,16 @@ export const refreshToken = async (req: Request, res: Response) => {
             if (err) return sendResponse(res, false, 403, 'Invalid refresh token');
 
             // Rotate the refresh token
-            const newRefreshToken = jwt.sign({ username: user.username, role: user.role }, refreshTokenSecret);
+            const username = storedToken.user?.username ?? user?.username;
+            const role = storedToken.user?.role ?? user?.role;
+            const id = storedToken.user?.id ?? user?.id;
+            const resellerId = (storedToken.user as any)?.resellerId ?? user?.resellerId ?? null;
+            const newRefreshToken = jwt.sign({ id, username, role, resellerId }, refreshTokenSecret);
             storedToken.token = newRefreshToken;
             storedToken.createdAt = new Date();
             await refreshTokenRepository.save(storedToken);
 
-            const accessToken = jwt.sign({ username: user.username, role: user.role }, jwtSecret, { expiresIn: '15m' });
+            const accessToken = jwt.sign({ id, username, role, resellerId }, jwtSecret, { expiresIn: '15m' });
             sendResponse(res, true, 200, 'Token refreshed successfully', { accessToken, refreshToken: newRefreshToken });
         });
     } catch (error) {
@@ -377,9 +403,64 @@ export const profile = async (req: Request, res: Response) => {
             return sendResponse(res, false, 404, 'User not found');
         }
 
-        sendResponse(res, true, 200, 'Profile fetched successfully', { username: user.username, email: user.email, role: user.role });
+        const permissions = await getEffectivePermissionsForUser({
+            userId: (req.user as any)?.id ?? user.id,
+            username: user.username,
+            roleKey: user.role ?? undefined,
+        });
+
+        sendResponse(res, true, 200, 'Profile fetched successfully', {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+            resellerId: (user as any).resellerId ?? null,
+            mustChangePassword: Boolean((user as any).mustChangePassword),
+            permissions,
+        });
     } catch (error) {
         sendResponse(res, false, 500, 'Internal server error');
+    }
+};
+
+/**
+ * POST /api/auth/change-password
+ * Body: { currentPassword, newPassword }
+ * Requires: Bearer token
+ */
+export const changePassword = async (req: Request, res: Response) => {
+    const { currentPassword, newPassword } = req.body ?? {};
+    if (typeof currentPassword !== 'string' || currentPassword.length === 0) {
+        return sendResponse(res, false, 400, 'currentPassword is required');
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
+        return sendResponse(res, false, 400, 'newPassword must be at least 8 characters');
+    }
+
+    const userRepository = AppDataSource.getRepository(SystemUsers);
+
+    try {
+        const username = (req.user as any)?.username;
+        if (!username) return sendResponse(res, false, 401, 'Unauthorized');
+
+        const user = await userRepository.findOne({ where: { username } });
+        if (!user) return sendResponse(res, false, 404, 'User not found');
+
+        const ok = await bcrypt.compare(currentPassword, user.password);
+        if (!ok) return sendResponse(res, false, 401, 'Invalid credentials');
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        (user as any).mustChangePassword = false;
+        (user as any).passwordChangedAt = new Date();
+        user.updatedAt = new Date();
+        await userRepository.save(user);
+
+        return sendResponse(res, true, 200, 'Password changed successfully', {
+            mustChangePassword: false,
+            passwordChangedAt: (user as any).passwordChangedAt,
+        });
+    } catch (error) {
+        return sendResponse(res, false, 500, 'Internal server error');
     }
 };
 

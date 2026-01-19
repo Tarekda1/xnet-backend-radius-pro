@@ -1,0 +1,38 @@
+groups:
+  - name: backend_basic
+    rules:
+      - alert: BackendDown
+        expr: up{job="backend"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Backend is down
+          description: Prometheus cannot scrape the backend /metrics endpoint.
+
+      - alert: BackendHigh5xxRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5..", job="backend"}[5m]))
+          /
+          sum(rate(http_requests_total{job="backend"}[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: High 5xx rate
+          description: More than 5% of requests are 5xx over the last 5 minutes.
+
+      - alert: BackendHighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{job="backend"}[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: High p95 latency
+          description: p95 request latency is > 1s for 10 minutes.
+
