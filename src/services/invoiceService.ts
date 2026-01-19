@@ -8,6 +8,34 @@ import { UserDetails } from '../db/entities/UserDetails';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
 import { invoiceEvents } from '../events/invoiceEvents';
 
+function isYmdOnly(value: string): boolean {
+    return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function ymdToLocalDayStart(ymd: string): Date {
+    // Interpret YYYY-MM-DD as local/server day start
+    return new Date(`${ymd}T00:00:00.000`);
+}
+
+function ymdToLocalNextDayStart(ymd: string): Date {
+    const d = ymdToLocalDayStart(ymd);
+    d.setDate(d.getDate() + 1);
+    return d;
+}
+
+function parseRangeStart(value: string): Date {
+    // If caller passes date-only, interpret as start-of-day in server/local time
+    // (avoids UTC shifting which can make "same-day" filters look empty)
+    if (isYmdOnly(value)) return ymdToLocalDayStart(value);
+    return new Date(value);
+}
+
+function parseRangeEnd(value: string): Date {
+    // If caller passes date-only, interpret as end-of-day in server/local time (inclusive)
+    if (isYmdOnly(value)) return new Date(`${value}T23:59:59.999`);
+    return new Date(value);
+}
+
 export const generateMonthlyInvoices = async () => {
     const userProfileRepo = AppDataSource.getRepository(Raduserprofile);
     const invoiceRepo = AppDataSource.getRepository(Invoices);
@@ -127,12 +155,34 @@ export const collectInvoice = async (invoiceId: number, collectorUsername: strin
     return invoice;
 };
 
-export const reconcileInvoiceCash = async (invoiceId: number, reconcilerUsername: string) => {
+export const reconcileInvoiceCash = async (
+    invoiceId: number,
+    reconcilerUsername: string,
+    actorRole?: 'admin' | 'manager' | 'support' | 'collector'
+) => {
     const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
     const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
     if (!invoice) {
         throw new Error('Invoice not found');
+    }
+
+    // RBAC: collectors can only reconcile invoices they collected
+    // (managers/admins can reconcile any)
+    if (actorRole === 'collector' && invoice.collectedBy !== reconcilerUsername) {
+        throw new Error('Forbidden');
+    }
+
+    if (!invoice.collectedBy) {
+        throw new Error('Invoice is not collected');
+    }
+
+    if ((invoice as any).paymentMethod !== 'cash') {
+        throw new Error('Only cash invoices can be reconciled');
+    }
+
+    if ((invoice as any).cashReconciled) {
+        return invoice;
     }
 
     (invoice as any).cashReconciled = true;
@@ -141,6 +191,66 @@ export const reconcileInvoiceCash = async (invoiceId: number, reconcilerUsername
 
     await invoiceRepo.save(invoice);
     return invoice;
+};
+
+export const reconcileBulkCash = async (params: {
+    dateFrom: string;
+    dateTo: string;
+    collector?: string;
+    actorUsername: string;
+}) => {
+    const { dateFrom, dateTo, collector, actorUsername } = params;
+
+    const from = parseRangeStart(dateFrom);
+    const to = parseRangeEnd(dateTo);
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+        throw new Error('Invalid date range');
+    }
+
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+
+    const qb = repo.createQueryBuilder('ext')
+        .select('ext.id', 'id')
+        .where('ext.deletedAt IS NULL')
+        .andWhere('ext.cashReconciled = :cashReconciled', { cashReconciled: false })
+        .andWhere('ext.paymentMethod = :paymentMethod', { paymentMethod: 'cash' })
+        .andWhere('ext.collectedBy IS NOT NULL')
+        .andWhere('ext.collectedAt IS NOT NULL');
+
+    // Robust whole-day filtering for YYYY-MM-DD inputs:
+    // use [fromStart, nextDayStart) to avoid midnight/precision/timezone edge cases.
+    if (isYmdOnly(dateFrom) && isYmdOnly(dateTo)) {
+        const fromStart = ymdToLocalDayStart(dateFrom);
+        const toExclusive = ymdToLocalNextDayStart(dateTo);
+        qb.andWhere('ext.collectedAt >= :from AND ext.collectedAt < :to', { from: fromStart, to: toExclusive });
+    } else {
+        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', { from, to });
+    }
+
+    if (collector) {
+        qb.andWhere('ext.collectedBy = :collector', { collector });
+    }
+
+    const rows = await qb.getRawMany<{ id: string | number }>();
+    const reconciledIds = rows
+        .map(r => Number(r.id))
+        .filter(n => Number.isFinite(n));
+
+    if (reconciledIds.length === 0) {
+        return { reconciledCount: 0, reconciledIds: [] as number[] };
+    }
+
+    await repo.createQueryBuilder()
+        .update(ExternalInvoice)
+        .set({
+            cashReconciled: true,
+            reconciledBy: actorUsername,
+            reconciledAt: new Date(),
+        } as any)
+        .whereInIds(reconciledIds)
+        .execute();
+
+    return { reconciledCount: reconciledIds.length, reconciledIds };
 };
 
 export const payExternalInvoice = async (
@@ -164,6 +274,29 @@ export const payExternalInvoice = async (
 
     await invoiceRepo.save(invoice);
 
+    return invoice;
+};
+
+export const unpayExternalInvoice = async (invoiceId: number, actorUsername: string) => {
+    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
+    if (!invoice) {
+        throw new Error('Invoice not found');
+    }
+
+    invoice.status = 'unpaid';
+    invoice.paidAt = null;
+    (invoice as any).paymentMethod = null;
+    (invoice as any).collectedBy = null;
+    (invoice as any).collectedAt = null;
+    (invoice as any).cashReconciled = false;
+    (invoice as any).reconciledBy = null;
+    (invoice as any).reconciledAt = null;
+    (invoice as any).modifiedBy = actorUsername;
+    (invoice as any).modifiedAt = new Date();
+    (invoice as any).lastAction = 'UNPAY';
+
+    await invoiceRepo.save(invoice);
     return invoice;
 };
 
@@ -535,14 +668,25 @@ export const getCollectedMetrics = async (dateFrom?: string, dateTo?: string) =>
         .andWhere('ext.deletedAt IS NULL');
 
     if (dateFrom && dateTo) {
-        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
-            from: new Date(dateFrom),
-            to: new Date(dateTo)
-        });
+        if (isYmdOnly(dateFrom) && isYmdOnly(dateTo)) {
+            qb.andWhere('ext.collectedAt >= :from AND ext.collectedAt < :to', {
+                from: ymdToLocalDayStart(dateFrom),
+                to: ymdToLocalNextDayStart(dateTo),
+            });
+        } else {
+            qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
+                from: parseRangeStart(dateFrom),
+                to: parseRangeEnd(dateTo)
+            });
+        }
     } else if (dateFrom) {
-        qb.andWhere('ext.collectedAt >= :from', { from: new Date(dateFrom) });
+        qb.andWhere('ext.collectedAt >= :from', { from: parseRangeStart(dateFrom) });
     } else if (dateTo) {
-        qb.andWhere('ext.collectedAt <= :to', { to: new Date(dateTo) });
+        if (isYmdOnly(dateTo)) {
+            qb.andWhere('ext.collectedAt < :to', { to: ymdToLocalNextDayStart(dateTo) });
+        } else {
+            qb.andWhere('ext.collectedAt <= :to', { to: parseRangeEnd(dateTo) });
+        }
     }
 
     const totalCollectedInvoices = await qb.clone().getCount();
@@ -565,14 +709,25 @@ export const getCollectorBreakdown = async (dateFrom?: string, dateTo?: string) 
         .orderBy('totalAmount', 'DESC');
 
     if (dateFrom && dateTo) {
-        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
-            from: new Date(dateFrom),
-            to: new Date(dateTo)
-        });
+        if (isYmdOnly(dateFrom) && isYmdOnly(dateTo)) {
+            qb.andWhere('ext.collectedAt >= :from AND ext.collectedAt < :to', {
+                from: ymdToLocalDayStart(dateFrom),
+                to: ymdToLocalNextDayStart(dateTo),
+            });
+        } else {
+            qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
+                from: parseRangeStart(dateFrom),
+                to: parseRangeEnd(dateTo)
+            });
+        }
     } else if (dateFrom) {
-        qb.andWhere('ext.collectedAt >= :from', { from: new Date(dateFrom) });
+        qb.andWhere('ext.collectedAt >= :from', { from: parseRangeStart(dateFrom) });
     } else if (dateTo) {
-        qb.andWhere('ext.collectedAt <= :to', { to: new Date(dateTo) });
+        if (isYmdOnly(dateTo)) {
+            qb.andWhere('ext.collectedAt < :to', { to: ymdToLocalNextDayStart(dateTo) });
+        } else {
+            qb.andWhere('ext.collectedAt <= :to', { to: parseRangeEnd(dateTo) });
+        }
     }
 
     const rows = await qb.getRawMany<{ collector: string; count: string; totalAmount: string }>();
@@ -598,14 +753,25 @@ export const getCollectedInvoicesList = async (
         .take(limit);
 
     if (dateFrom && dateTo) {
-        qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
-            from: new Date(dateFrom),
-            to: new Date(dateTo)
-        });
+        if (isYmdOnly(dateFrom) && isYmdOnly(dateTo)) {
+            qb.andWhere('ext.collectedAt >= :from AND ext.collectedAt < :to', {
+                from: ymdToLocalDayStart(dateFrom),
+                to: ymdToLocalNextDayStart(dateTo),
+            });
+        } else {
+            qb.andWhere('ext.collectedAt BETWEEN :from AND :to', {
+                from: parseRangeStart(dateFrom),
+                to: parseRangeEnd(dateTo)
+            });
+        }
     } else if (dateFrom) {
-        qb.andWhere('ext.collectedAt >= :from', { from: new Date(dateFrom) });
+        qb.andWhere('ext.collectedAt >= :from', { from: parseRangeStart(dateFrom) });
     } else if (dateTo) {
-        qb.andWhere('ext.collectedAt <= :to', { to: new Date(dateTo) });
+        if (isYmdOnly(dateTo)) {
+            qb.andWhere('ext.collectedAt < :to', { to: ymdToLocalNextDayStart(dateTo) });
+        } else {
+            qb.andWhere('ext.collectedAt <= :to', { to: parseRangeEnd(dateTo) });
+        }
     }
 
     const [data, total] = await qb.getManyAndCount();

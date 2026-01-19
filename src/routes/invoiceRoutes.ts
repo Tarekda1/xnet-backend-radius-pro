@@ -1,8 +1,8 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalInvoicesHandler, getInvoicesHandler, payExternalInvoiceHandler, payInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalInvoicesHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler } from "../controllers/invoiceController";
 import multer from "multer";
-import { authenticateToken, authorizeRoles } from '../middleware/authMiddleware';
+import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({ dest: "uploads/" }); // temp folder
 
 const router = Router();
@@ -11,12 +11,30 @@ router.get("/", getInvoicesHandler);
 // Add route for paying a single invoice
 router.post("/pay/:invoiceId", authenticateToken, authorizeRoles('admin','manager','support','collector'), payInvoiceHandler);
 router.post("/collect/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), collectInvoiceHandler);
-router.post("/reconcile/:invoiceId", authenticateToken, authorizeRoles('manager','admin'), reconcileInvoiceCashHandler);
+// IMPORTANT: define /reconcile/bulk before /reconcile/:invoiceId
+router.post("/reconcile/bulk", authenticateToken, authorizeRoles('collector','manager','admin'), reconcileBulkCashHandler);
+router.post("/reconcile/:invoiceId", authenticateToken, authorizeRoles('collector','manager','admin'), reconcileInvoiceCashHandler);
 // Add route for bulk paying invoices
 router.post("/bulk-pay", authenticateToken, authorizeRoles('admin','manager'), bulkPayInvoicesHandler);
-router.post("/upload", upload.single("file"), uploadExternalInvoiceFile);
-router.get("/external", getExternalInvoicesHandler);
-router.post("/external/pay/:invoiceId",authenticateToken, payExternalInvoiceHandler);
+router.post("/upload", authenticateToken, authorizePermissions('billing.invoiceUpload.create'), upload.single("file"), uploadExternalInvoiceFile);
+router.get(
+  "/external",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.unpay"
+  ),
+  getExternalInvoicesHandler
+);
+router.post(
+  "/external/pay/:invoiceId",
+  authenticateToken,
+  authorizePermissions('billing.externalInvoices.pay'),
+  payExternalInvoiceHandler
+);
+router.post("/external/unpay/:invoiceId", authenticateToken, authorizePermissions('billing.externalInvoices.unpay'), unpayExternalInvoiceHandler);
 router.put("/external/:invoiceId",authenticateToken, updateExternalInvoiceHandler);
 router.delete("/external/:invoiceId", authenticateToken,deleteExternalInvoiceHandler);
 router.post("/external/bulk-delete", authenticateToken, authorizeRoles('admin','manager'), bulkDeleteExternalInvoicesHandler);

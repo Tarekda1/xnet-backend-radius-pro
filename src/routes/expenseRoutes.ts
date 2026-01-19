@@ -6,7 +6,7 @@ import {
   listExpensesHandler,
   updateExpenseHandler,
 } from "../controllers/expenseController";
-import { authenticateToken, authorizeRoles } from "../middleware/authMiddleware";
+import { authenticateToken, authorizePermissions, authorizeRoles } from "../middleware/authMiddleware";
 
 const router = Router();
 
@@ -14,6 +14,7 @@ const router = Router();
 router.get(
   "/",
   authenticateToken,
+  authorizePermissions("admin.expenses.view"),
   authorizeRoles("admin", "manager", "support", "collector"),
   listExpensesHandler
 );
@@ -22,6 +23,7 @@ router.get(
 router.get(
   "/monthly-totals",
   authenticateToken,
+  authorizePermissions("admin.expenses.view"),
   authorizeRoles("admin", "manager", "support", "collector"),
   expenseMonthlyTotalsHandler
 );
@@ -30,6 +32,7 @@ router.get(
 router.post(
   "/",
   authenticateToken,
+  authorizePermissions("admin.expenses.view"),
   authorizeRoles("admin", "manager"),
   createExpenseHandler
 );
@@ -38,6 +41,7 @@ router.post(
 router.put(
   "/:id",
   authenticateToken,
+  authorizePermissions("admin.expenses.view"),
   authorizeRoles("admin", "manager"),
   updateExpenseHandler
 );
@@ -46,6 +50,7 @@ router.put(
 router.delete(
   "/:id",
   authenticateToken,
+  authorizePermissions("admin.expenses.view"),
   authorizeRoles("admin", "manager"),
   deleteExpenseHandler
 );

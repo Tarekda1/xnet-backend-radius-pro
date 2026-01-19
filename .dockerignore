@@ -1,0 +1,22 @@
+node_modules
+dist
+coverage
+.nyc_output
+.npm-cache
+
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+*.log
+combined.log
+
+# Local uploads / runtime data
+uploads
+
+# OS junk
+.DS_Store
+Thumbs.db
+

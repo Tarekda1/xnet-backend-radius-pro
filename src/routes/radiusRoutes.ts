@@ -1,10 +1,14 @@
 import { Router } from 'express';
 import { UserController } from '../controllers/userController';
-import { authenticateToken } from '../middleware/authMiddleware';
+import { authenticateToken, authorizeAnyPermissions } from '../middleware/authMiddleware';
 
 const router = Router();
 
-//router.use(authenticateToken);
+// Protect all radius user APIs
+router.use(authenticateToken);
+// NOTE: For now we gate all endpoints by "view" permissions.
+// (We can split manage permissions later if needed.)
+router.use(authorizeAnyPermissions('users.view', 'reseller.users.view'));
 
 router.get('/users/search', UserController.searchUsers);
 router.get('/users/:id', UserController.getRadUser);

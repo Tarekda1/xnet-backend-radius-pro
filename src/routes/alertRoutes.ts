@@ -11,12 +11,13 @@ import {
   updateAlertSettings,
   testAlert
 } from '../controllers/alertController';
-import { authenticateToken } from '../middleware/authMiddleware';
+import { authenticateToken, authorizePermissions } from '../middleware/authMiddleware';
 
 const router = Router();
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
+router.use(authorizePermissions('admin.alerts.view'));
 
 // Helper function to handle async route handlers
 const asyncHandler = (fn: (req: Request, res: Response, next: NextFunction) => Promise<any>): RequestHandler =>
