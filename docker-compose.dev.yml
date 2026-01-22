@@ -13,27 +13,27 @@ services:
     environment:
       - NODE_ENV=development
       - PORT=3000
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
-      - REDIS_URL=redis://redis:6379
-      - MYSQL_HOST=host.docker.internal
-      - MYSQL_PORT=3306
-      - MYSQL_USER=radius
-      - MYSQL_PASSWORD=password
-      - MYSQL_DATABASE=radius
+      - RABBITMQ_URL=${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_USERNAME=${DB_USERNAME:-radius}
+      - DB_PASSWORD=${DB_PASSWORD:-password}
+      - DB_NAME=${DB_NAME:-radius}
       # WhatsApp template settings (for Cloud API fallback)
-      - WHATSAPP_TEMPLATE_NAME=payment_confirmation
-      - WHATSAPP_TEMPLATE_LANGUAGE_CODE=en_US
+      - WHATSAPP_TEMPLATE_NAME=${WHATSAPP_TEMPLATE_NAME:-payment_confirmation}
+      - WHATSAPP_TEMPLATE_LANGUAGE_CODE=${WHATSAPP_TEMPLATE_LANGUAGE_CODE:-en_US}
       # Use Twilio as the WhatsApp provider
-      - WHATSAPP_PROVIDER=twilio
+      - WHATSAPP_PROVIDER=${WHATSAPP_PROVIDER:-cloud}
       # Twilio credentials and sender configuration
-      - TWILIO_ACCOUNT_SID=AC_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-      - TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
       # EITHER use Messaging Service (recommended for production)
-      - TWILIO_MESSAGING_SERVICE_SID=MG_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - TWILIO_MESSAGING_SERVICE_SID=${TWILIO_MESSAGING_SERVICE_SID:-}
       # OR specify a From sender (do not set both)
-      - TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+      - TWILIO_WHATSAPP_FROM=${TWILIO_WHATSAPP_FROM:-}
       # Optional delivery status callback
-      - TWILIO_STATUS_CALLBACK_URL=
+      - TWILIO_STATUS_CALLBACK_URL=${TWILIO_STATUS_CALLBACK_URL:-}
     depends_on:
       - redis
       - rabbitmq

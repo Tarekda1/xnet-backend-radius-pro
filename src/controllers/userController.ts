@@ -73,6 +73,47 @@ function formatUsersWithStatus(entities: any, raw: any) {
     }));
 }
 
+async function getFreshUsersStatusMap(
+    usernames: string[],
+    staleCutoff: Date
+): Promise<Record<string, { isOnline: boolean; lastTimeActive: any }>> {
+    if (!Array.isArray(usernames) || usernames.length === 0) return {};
+
+    const sessionRepo = AppDataSource.getRepository(SessionTracking);
+
+    // Match the same "online" definition used by the OnlineUsers endpoint:
+    // - SessionTracking is active
+    // - AND there exists an open radacct session with a recent update (>= staleCutoff)
+    const rows = await sessionRepo
+        .createQueryBuilder("st")
+        .select("st.username", "username")
+        .addSelect("MAX(CASE WHEN ra.acctsessionid IS NOT NULL THEN 1 ELSE 0 END)", "isOnline")
+        .addSelect(
+            "MAX(COALESCE(ra.acctupdatetime, ra.acctstarttime, st.last_update, st.start_time))",
+            "lastTimeActive"
+        )
+        .leftJoin(
+            "radacct",
+            "ra",
+            "ra.acctsessionid = st.session_id AND ra.acctstoptime IS NULL AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff",
+            { staleCutoff }
+        )
+        .where("st.status = 'active'")
+        .andWhere("st.username IN (:...usernames)", { usernames })
+        .groupBy("st.username")
+        .getRawMany<{ username: string; isOnline: any; lastTimeActive: any }>();
+
+    return rows.reduce((acc, row) => {
+        const username = row?.username;
+        if (!username) return acc;
+        acc[username] = {
+            isOnline: row.isOnline === true || row.isOnline === 1 || row.isOnline === "1",
+            lastTimeActive: row.lastTimeActive ?? null,
+        };
+        return acc;
+    }, {} as Record<string, { isOnline: boolean; lastTimeActive: any }>);
+}
+
 
 export const UserController = {
     quotaService: new QuotaService(AppDataSource, eventBus, new CacheService()),
@@ -90,30 +131,32 @@ export const UserController = {
             const cacheKey = `users_page_${scope}_${page}_limit_${limit}`;
             const statusCacheKey = `users_status_${scope}_${page}_limit_${limit}`;
 
+            // Keep "online" consistent with OnlineUsers:
+            // treat sessions as online only if we saw a recent radacct update.
+            const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+            const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+            const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+
             // 🔹 Check Redis cache for user data
             const cachedResponse = await redisClient.get(cacheKey);
-            const cachedStatus = await redisClient.get(statusCacheKey);
 
-            if (cachedResponse && cachedStatus) {
+            // If the user list is cached, still refresh the status from DB so UI stays in sync.
+            if (cachedResponse) {
                 const userData = JSON.parse(cachedResponse);
-                const statusData = JSON.parse(cachedStatus);
-                
-                // Merge the cached user data with fresh status data
+                const users = Array.isArray(userData?.users) ? userData.users : [];
+                const usernames = users.map((u: any) => u?.username).filter(Boolean);
+
+                const freshStatus = await getFreshUsersStatusMap(usernames, staleCutoff);
+
                 const mergedData = {
                     ...userData,
-                    users: userData.users.map((user: any) => ({
+                    users: users.map((user: any) => ({
                         ...user,
-                        isOnline:
-                          typeof statusData[user.username] === "object"
-                            ? !!statusData[user.username]?.isOnline
-                            : !!statusData[user.username],
-                        lastTimeActive:
-                          typeof statusData[user.username] === "object"
-                            ? (statusData[user.username]?.lastTimeActive ?? user.lastTimeActive ?? null)
-                            : (user.lastTimeActive ?? null),
-                    }))
+                        isOnline: !!freshStatus[user.username]?.isOnline,
+                        lastTimeActive: freshStatus[user.username]?.lastTimeActive ?? user.lastTimeActive ?? null,
+                    })),
                 };
-                
+
                 return sendResponse(res, true, 200, "Users fetched successfully", mergedData);
             }
 
@@ -125,7 +168,9 @@ export const UserController = {
             const totalUsers = await totalUsersQb.getCount();
 
             // 🔹 Fetch users with profile relation and left join UserMac
-            const onlineGraceSeconds = Number(process.env.ONLINE_GRACE_SECONDS ?? 120);
+            // Keep "online" consistent with the OnlineUsers page:
+            // a user is online only if there is an active SessionTracking row AND a corresponding
+            // radacct session with a recent update (prevents stale "online" forever).
             const qb = userRepository
                 .createQueryBuilder("user")
                 .leftJoinAndSelect("user.profile", "profile")
@@ -153,12 +198,18 @@ export const UserController = {
                             .from(SessionTracking, "st")
                             .select([
                                 "st.username AS st_username",
-                                // User-requested online flag: any active session with end_time IS NULL
-                                "MAX(CASE WHEN st.end_time IS NULL THEN 1 ELSE 0 END) AS has_open_active_session",
-                                // Optional freshness signal (used only for last active / debugging)
-                                "MAX(COALESCE(st.last_update, st.start_time)) AS last_active_ping",
+                                // Online = there exists an active session with a matching open radacct row
+                                // that has been updated recently (acctupdatetime/starttime within staleCutoff).
+                                "MAX(CASE WHEN ra.acctsessionid IS NOT NULL THEN 1 ELSE 0 END) AS is_online",
+                                "MAX(COALESCE(ra.acctupdatetime, ra.acctstarttime, st.last_update, st.start_time)) AS last_online_ping",
                             ])
                             .where("st.status = 'active'")
+                            .leftJoin(
+                                "radacct",
+                                "ra",
+                                "ra.acctsessionid = st.session_id AND ra.acctstoptime IS NULL AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff",
+                                { staleCutoff }
+                            )
                             .groupBy("st.username"),
                     "activeSess",
                     "user.username = activeSess.st_username"
@@ -197,15 +248,17 @@ export const UserController = {
                     "userDetails.email",
                 ])
                 .addSelect(
-                    // Online rule requested: open active session (end_time IS NULL)
-                    "CASE WHEN COALESCE(activeSess.has_open_active_session, 0) = 1 THEN true ELSE false END",
+                    "CASE WHEN COALESCE(activeSess.is_online, 0) = 1 THEN true ELSE false END",
                     "isOnline"
                 )
-                .addSelect("lastActive.last_time_active", "lastTimeActive")
+                .addSelect(
+                    "COALESCE(activeSess.last_online_ping, lastActive.last_time_active)",
+                    "lastTimeActive"
+                )
                 .orderBy("user.id", "ASC")
                 .limit(limit)
                 .offset(offset)
-                .setParameters({ onlineGrace: onlineGraceSeconds })
+                .setParameters({ staleCutoff })
             
             if (isReseller) {
                 qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
@@ -530,6 +583,10 @@ export const UserController = {
 
             const userRepository = AppDataSource.getRepository(Raduserprofile);
 
+            const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+            const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+            const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+
             const qb = userRepository
                 .createQueryBuilder("user")
                 .leftJoinAndSelect("user.profile", "profile")
@@ -557,10 +614,16 @@ export const UserController = {
                             .from(SessionTracking, "st")
                             .select([
                                 "st.username AS st_username",
-                                "MAX(CASE WHEN st.end_time IS NULL THEN 1 ELSE 0 END) AS has_open_active_session",
-                                "MAX(COALESCE(st.last_update, st.start_time)) AS last_active_ping",
+                                "MAX(CASE WHEN ra.acctsessionid IS NOT NULL THEN 1 ELSE 0 END) AS is_online",
+                                "MAX(COALESCE(ra.acctupdatetime, ra.acctstarttime, st.last_update, st.start_time)) AS last_online_ping",
                             ])
                             .where("st.status = 'active'")
+                            .leftJoin(
+                                "radacct",
+                                "ra",
+                                "ra.acctsessionid = st.session_id AND ra.acctstoptime IS NULL AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff",
+                                { staleCutoff }
+                            )
                             .groupBy("st.username"),
                     "activeSess",
                     "user.username = activeSess.st_username"
@@ -578,10 +641,13 @@ export const UserController = {
                     "user.username = lastActive.la_username"
                 )
                 .addSelect(
-                    "CASE WHEN COALESCE(activeSess.has_open_active_session, 0) = 1 THEN true ELSE false END",
+                    "CASE WHEN COALESCE(activeSess.is_online, 0) = 1 THEN true ELSE false END",
                     "isOnline"
                 )
-                .addSelect("lastActive.last_time_active", "lastTimeActive")
+                .addSelect(
+                    "COALESCE(activeSess.last_online_ping, lastActive.last_time_active)",
+                    "lastTimeActive"
+                )
                 .where("user.username LIKE :query", { query: `%${query}%` })
                 .orWhere("userDetails.email LIKE :query", { query: `%${query}%` })
                 .orWhere("userDetails.fullName LIKE :query", { query: `%${query}%` })
@@ -613,7 +679,7 @@ export const UserController = {
                     "userDetails.email",
                 ])
                 .orderBy("user.id", "ASC")
-                .setParameters({ onlineGrace: Number(process.env.ONLINE_GRACE_SECONDS ?? 120) })
+                .setParameters({ staleCutoff })
                 .getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);

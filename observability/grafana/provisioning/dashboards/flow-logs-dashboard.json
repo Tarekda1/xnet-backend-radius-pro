@@ -1,0 +1,41 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "vertamedia-clickhouse-datasource", "uid": "PCB76D98C63DCC326" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "showHeader": true },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": { "type": "vertamedia-clickhouse-datasource", "uid": "PCB76D98C63DCC326" },
+          "format": "table",
+          "rawQuery": true,
+          "query": "SELECT username, dst_ip, dst_port, sum(bytes) AS bytes\nFROM flow_logs.user_flow_logs\nWHERE $timeFilterByColumn(ts)\nGROUP BY username, dst_ip, dst_port\nORDER BY bytes DESC\nLIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Top destinations by bytes (last range)",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["flows", "pppoe"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "User Flow Logs",
+  "uid": "user-flow-logs",
+  "version": 1
+}
+

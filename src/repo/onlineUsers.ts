@@ -4,10 +4,10 @@ import { SessionTracking } from "../db/entities/SessionTracking";
 
 export const getOnlineUsers = async () => {
 
-    const today = new Date().toISOString().split("T")[0]; // Get today's date in YYYY-MM-DD format
-    // const firstDayOfMonth = new Date(today);
-    // firstDayOfMonth.setDate(1); // Get the first day of the month
-    // const firstDayOfMonthStr = firstDayOfMonth.toISOString().split("T")[0];
+    // Consider a user "online" only if the session has a recent update.
+    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
 
     const sessionRepo = AppDataSource.getRepository(SessionTracking);
     const radUserProfileRepo = AppDataSource.getRepository(Raduserprofile);
@@ -16,7 +16,17 @@ export const getOnlineUsers = async () => {
      const totalOnlineUsers = await sessionRepo
      .createQueryBuilder("session")
      .where("session.status = :status", { status: "active" })
-     .andWhere("session.startTime >= :today", { today })
+     // Use radacct as source of truth: must have an open accounting session with a recent update.
+     .andWhere(
+        `EXISTS (
+           SELECT 1
+           FROM radacct ra
+           WHERE ra.acctsessionid = session.session_id
+             AND ra.acctstoptime IS NULL
+             AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
+         )`,
+        { staleCutoff }
+     )
      .getCount();
 
      const totalActiveUsers = await radUserProfileRepo

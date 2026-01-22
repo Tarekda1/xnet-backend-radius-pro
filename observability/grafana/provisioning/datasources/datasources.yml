@@ -14,3 +14,34 @@ datasources:
     url: http://prometheus:9090
     editable: false
 
+  - name: Radius MySQL
+    type: mysql
+    access: proxy
+    url: 172.8.16.4:3306
+    database: radius
+    user: radius
+    editable: false
+    jsonData:
+      tlsSkipVerify: true
+      maxOpenConns: 50
+      maxIdleConns: 10
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: password
+
+  - name: ClickHouse (Flow Logs)
+    uid: PCB76D98C63DCC326
+    type: vertamedia-clickhouse-datasource
+    access: proxy
+    url: http://clickhouse:8123
+    basicAuth: true
+    basicAuthUser: flow
+    editable: false
+    jsonData:
+      defaultDatabase: flow_logs
+      username: flow
+      # Optional: TLS, additional settings can go here
+    secureJsonData:
+      password: flowpass
+      basicAuthPassword: flowpass
+

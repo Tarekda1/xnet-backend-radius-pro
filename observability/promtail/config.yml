@@ -28,3 +28,18 @@ scrape_configs:
     pipeline_stages:
       - docker: {}
 
+  # FreeRADIUS "detail" file logs (NOT container stdout).
+  # These are written under /var/log/freeradius by the radius container and mounted into promtail via docker-compose.yml.
+  - job_name: freeradius-files
+    static_configs:
+      - targets: ['localhost']
+        labels:
+          job: freeradius-files
+          app: freeradius
+          __path__: /var/log/freeradius/radius.log
+      - targets: ['localhost']
+        labels:
+          job: freeradius-files
+          app: freeradius
+          __path__: /var/log/freeradius/radacct/**/auth-detail-*
+
