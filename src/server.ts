@@ -32,6 +32,7 @@ import bandwidthRoutes from './routes/bandwidthRoutes';
 import expenseRoutes from './routes/expenseRoutes';
 import accessRoutes from './routes/accessRoutes';
 import resellerRoutes from './routes/resellerRoutes';
+import auditRoutes from './routes/auditRoutes';
 import './events/invoiceListeners'
 import cors from 'cors';
 import eventBus from './bus/eventBusSingleton';
@@ -176,6 +177,8 @@ app.use("/api/bandwidth", bandwidthRoutes);
 app.use("/api/expenses", expenseRoutes);
 
 app.use("/api/access", accessRoutes);
+
+app.use("/api", auditRoutes);
 
 app.use("/api", resellerRoutes);
 

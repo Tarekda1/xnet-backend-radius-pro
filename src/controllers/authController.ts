@@ -45,7 +45,21 @@ export const getAllUsers = async (req: Request, res: Response) => {
     const offset = (page - 1) * limit;
 
     try {
+        // IMPORTANT: never return password hashes to clients
         const [users, total] = await userRepository.findAndCount({
+            select: [
+                "id",
+                "username",
+                "email",
+                "role",
+                "resellerId",
+                "mustChangePassword",
+                "passwordChangedAt",
+                "isActive",
+                "createdAt",
+                "updatedAt",
+                "lastLogin",
+            ] as any,
             skip: offset,
             take: limit,
         });
@@ -104,9 +118,10 @@ export const register = [
         throw new Error('Invalid email');
     }), // Email is optional,
     body('password').isString().notEmpty(),
-    body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector']),
+    body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector', 'reseller']),
+    body('isActive').optional().isBoolean(),
     async (req: Request, res: Response) => {
-        const { username, email, password, role } = req.body;
+        const { username, email, password, role, isActive } = req.body;
         const userRepository = AppDataSource.getRepository(SystemUsers);
 
         try {
@@ -116,7 +131,15 @@ export const register = [
             }
 
             const hashedPassword = await bcrypt.hash(password, 10);
-            const newUser = userRepository.create({ username, email, password: hashedPassword, role });
+            const newUser = userRepository.create({
+                username,
+                email,
+                password: hashedPassword,
+                role,
+                isActive: typeof isActive === "boolean" ? isActive : true,
+                mustChangePassword: false,
+                passwordChangedAt: new Date(),
+            });
             await userRepository.save(newUser);
 
             sendResponse(res, true, 201, 'User registered successfully');
@@ -170,15 +193,22 @@ export const updateUser = [
         }
         throw new Error('Invalid email');
     }),
-    body('password').optional().isString(),
-    body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector']),
+    body('password').optional().isString().custom((value) => {
+        // Treat empty string as "not provided" (frontend uses blank for no change)
+        if (value === "" || value === null || value === undefined) return true;
+        if (typeof value === "string" && value.length >= 8) return true;
+        throw new Error("password must be at least 8 characters");
+    }),
+    body('role').optional().isString().isIn(['admin', 'manager', 'support', 'collector', 'reseller']),
+    body('isActive').optional().isBoolean(),
+    body('mustChangePassword').optional().isBoolean(),
     async (req: Request, res: Response) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return sendResponse(res, false, 400, 'Validation errors', errors.array());
         }
 
-        const { username, email, password, role } = req.body;
+        const { username, email, password, role, isActive, mustChangePassword } = req.body;
         const userRepository = AppDataSource.getRepository(SystemUsers);
 
         try {
@@ -188,8 +218,14 @@ export const updateUser = [
             }
 
             if (email !== undefined) user.email = email;
-            if (password !== undefined) user.password = await bcrypt.hash(password, 10);
+            if (typeof password === "string" && password.length > 0) {
+                user.password = await bcrypt.hash(password, 10);
+                (user as any).passwordChangedAt = new Date();
+            }
             if (role !== undefined) user.role = role;
+            if (typeof isActive === "boolean") user.isActive = isActive;
+            if (typeof mustChangePassword === "boolean") (user as any).mustChangePassword = mustChangePassword;
+            user.updatedAt = new Date();
 
             await userRepository.save(user);
 
@@ -199,6 +235,42 @@ export const updateUser = [
         }
     }
 ];
+
+/**
+ * POST /api/auth/users/:id/reset-password
+ * Body: { newPassword: string, mustChangePassword?: boolean }
+ * Requires: admin.authUsers.manage
+ */
+export const adminResetUserPassword = async (req: Request, res: Response) => {
+    const userId = Number(req.params.id);
+    const { newPassword, mustChangePassword } = req.body ?? {};
+
+    if (!Number.isFinite(userId)) return sendResponse(res, false, 400, "Invalid id");
+    if (typeof newPassword !== "string" || newPassword.length < 8) {
+        return sendResponse(res, false, 400, "newPassword must be at least 8 characters");
+    }
+
+    const userRepository = AppDataSource.getRepository(SystemUsers);
+    try {
+        const user = await userRepository.findOne({ where: { id: userId } });
+        if (!user) return sendResponse(res, false, 404, "User not found");
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        (user as any).passwordChangedAt = new Date();
+        (user as any).mustChangePassword = typeof mustChangePassword === "boolean" ? mustChangePassword : true;
+        user.updatedAt = new Date();
+        await userRepository.save(user);
+
+        return sendResponse(res, true, 200, "Password reset successfully", {
+            id: user.id,
+            username: user.username,
+            mustChangePassword: Boolean((user as any).mustChangePassword),
+            passwordChangedAt: (user as any).passwordChangedAt,
+        });
+    } catch (e) {
+        return sendResponse(res, false, 500, "Internal server error");
+    }
+};
 
 // Postman request body example for registering a user
 /*

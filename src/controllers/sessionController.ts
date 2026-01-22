@@ -15,6 +15,133 @@ export const healthCheck = (req: Request, res: Response) => {
   res.status(200).json({ status: 'UP' });
 };
 
+export const getLiveSessionDetail = async (req: Request, res: Response) => {
+  try {
+    const username = String(req.params.username || "").trim();
+    if (!username) {
+      res.status(400).json({ success: false, message: "username is required" });
+      return;
+    }
+
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+
+    const repo = AppDataSource.getRepository(SessionTracking);
+    const qb = repo
+      .createQueryBuilder("session")
+      .leftJoin(Raduserprofile, "userProfile", "session.username = userProfile.username")
+      .leftJoin(Radprofile, "profile", "userProfile.profile_id = profile.id")
+      .leftJoin(UserDetails, "userDetails", "session.username = userDetails.username")
+      .leftJoin(
+        Radacct,
+        "raLive",
+        "raLive.acctsessionid = session.session_id AND raLive.acctstoptime IS NULL AND COALESCE(raLive.acctupdatetime, raLive.acctstarttime) >= :staleCutoff",
+        { staleCutoff }
+      )
+      .select([
+        "session.username AS username",
+        "session.session_id AS sessionId",
+        "session.macAddress AS macAddress",
+        "session.status AS status",
+        "session.startTime AS startTime",
+        "session.lastUpdate AS lastUpdate",
+        "session.sessionTime AS sessionTime",
+        "COALESCE(raLive.nasipaddress, NULL) AS nasIpAddress",
+        "COALESCE(raLive.framedipaddress, NULL) AS framedIpAddress",
+        "COALESCE(raLive.callingstationid, NULL) AS callingStationId",
+        "COALESCE(raLive.acctstarttime, NULL) AS acctStartTime",
+        "COALESCE(raLive.acctupdatetime, NULL) AS acctUpdateTime",
+        "COALESCE(raLive.acctinputoctets, 0) AS totalBytesIn",
+        "COALESCE(raLive.acctoutputoctets, 0) AS totalBytesOut",
+        "profile.profile_name AS profileName",
+        "profile.daily_quota AS dailyQuota",
+        "profile.monthly_quota AS monthlyQuota",
+        "COALESCE(userProfile.is_fallback, 0) AS isFallback",
+        "userDetails.fullName AS fullName",
+      ])
+      .where("session.status = 'active'")
+      .andWhere("session.username = :username", { username })
+      .andWhere(
+        `EXISTS (
+           SELECT 1
+           FROM radacct ra
+           WHERE ra.acctsessionid = session.session_id
+             AND ra.acctstoptime IS NULL
+             AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
+         )`,
+        { staleCutoff }
+      );
+
+    if (isReseller) {
+      qb.andWhere("userProfile.owner_reseller_id = :rid", { rid: resellerId });
+    }
+
+    const row = await qb.getRawOne<any>();
+    if (!row) {
+      res.status(404).json({ success: false, message: "No live session found" });
+      return;
+    }
+
+    res.status(200).json({ success: true, message: "Live session fetched", data: row });
+  } catch (error) {
+    console.error("Error fetching live session detail:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+export const getUserRejects = async (req: Request, res: Response) => {
+  try {
+    const username = String(req.params.username || "").trim();
+    if (!username) {
+      res.status(400).json({ success: false, message: "username is required" });
+      return;
+    }
+
+    const limitRaw = parseInt(String(req.query.limit ?? "50"), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    const repo = AppDataSource.getRepository(ConnectionLogs);
+    const qb = repo
+      .createQueryBuilder("cl")
+      .select([
+        "cl.timestamp AS timestamp",
+        "cl.nasIp AS nasIp",
+        "cl.macAddress AS macAddress",
+        "cl.status AS status",
+      ])
+      .where("cl.username = :username", { username })
+      .andWhere("cl.status IN ('rejected','timeout','error')")
+      .orderBy("cl.timestamp", "DESC")
+      .limit(limit);
+
+    if (isReseller) {
+      qb.innerJoin(
+        Raduserprofile,
+        "u",
+        "u.username = cl.username AND u.owner_reseller_id = :rid",
+        { rid: resellerId }
+      );
+    }
+
+    const rows = await qb.getRawMany();
+    res.status(200).json({ success: true, message: "Rejects fetched", data: rows });
+  } catch (error) {
+    console.error("Error fetching rejects:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
 export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
   try {
     const role = (req.user as any)?.role as string | undefined;

@@ -1,11 +1,13 @@
 import { Request, Response } from 'express';
 import { AppDataSource } from '../db/config';
 import { Raduserprofile } from '../db/entities/Raduserprofile';
+import { Radprofile } from '../db/entities/Radprofile';
 import { body, validationResult } from 'express-validator';
 import { redisClient } from "../redisClient"
 import { UserMac } from '../db/entities/UserMac';
 import { Radusagestats } from '../db/entities/Radusagestats';
 import { Radcheck } from '../db/entities/Radcheck';
+import { Logs } from '../db/entities/Logs';
 import { promisify } from "util";
 import { exec } from 'child_process';
 import eventBus from '../bus/eventBusSingleton';
@@ -20,6 +22,44 @@ import { Invoices } from '../db/entities/Invoices';
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
     res.status(status).json({ success, message, data });
 };
+
+function normalizeUsernames(input: unknown): string[] {
+    if (!Array.isArray(input)) return [];
+    const cleaned = input
+        .map((u) => String(u ?? "").trim())
+        .filter((u) => u.length > 0)
+        .map((u) => u.toLowerCase() === u ? u : u); // preserve exact value (no forced lowercasing)
+    return Array.from(new Set(cleaned));
+}
+
+async function writeAuditLog(params: {
+    req: Request;
+    action: string;
+    targetUsernames: string[];
+    meta?: Record<string, any>;
+}) {
+    try {
+        const repo = AppDataSource.getRepository(Logs);
+        const entry = new Logs();
+        entry.level = "info";
+        entry.message = `audit.${params.action}`;
+        entry.meta = {
+            requestId: (params.req as any)?.requestId,
+            actor: {
+                id: (params.req.user as any)?.id ?? null,
+                username: (params.req.user as any)?.username ?? null,
+                role: (params.req.user as any)?.role ?? null,
+                resellerId: (params.req.user as any)?.resellerId ?? null,
+            },
+            targets: params.targetUsernames,
+            ...(params.meta ?? {}),
+        };
+        await repo.save(entry);
+    } catch (e) {
+        // Never fail the main request due to audit logging issues.
+        console.warn("Audit log write failed", e);
+    }
+}
 
 function getResellerFilter(req: Request): { isReseller: boolean; resellerId: number | null } {
     const role = (req.user as any)?.role as string | undefined;
@@ -325,8 +365,9 @@ export const UserController = {
         body('username').isString().notEmpty(),
         body('password').isString().notEmpty(),
         body('profileId').isInt().notEmpty(),
+        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated"]),
         body('quotaResetDay').isInt().optional(),
-        body('fullName').isString().notEmpty(),
+        body('fullName').optional().isString(),
         body('address').isString().optional(),
         body('phoneNumber').isString().optional(),
         body('email').optional().custom((value) => {
@@ -348,8 +389,9 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, quotaResetDay, fullName, address, phoneNumber, email } = req.body;
+            const { username, password, profileId, accountStatus, quotaResetDay, fullName, address, phoneNumber, email } = req.body;
             try {
+                const { isReseller, resellerId } = getResellerFilter(req);
                 const userRepository = AppDataSource.getRepository(Raduserprofile);
                 const existingUser = await userRepository.findOne({ where: { username } });
                 const userDetailsRepository = AppDataSource.getRepository(UserDetails);
@@ -375,7 +417,10 @@ export const UserController = {
                 user.isFallback = false;
                 user.isMonthlyExceeded = false;
                 user.quotaResetDay = quotaResetDay || new Date().getDate();
-                user.accountStatus = 'active';
+                user.accountStatus = (accountStatus || 'active') as any;
+                if (isReseller && resellerId) {
+                    (user as any).ownerResellerId = resellerId;
+                }
                 await userRepository.save(user);
 
                 // Create UserDetails entity
@@ -701,7 +746,552 @@ export const UserController = {
             console.error("Error searching users:", error);
             return sendResponse(res, false, 500, "Error searching users");
         }
-    }
+    },
+
+    bulkAssignProfile: async (req: Request, res: Response) => {
+        try {
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const usernames = normalizeUsernames(req.body?.usernames);
+            const profileId = Number(req.body?.profileId);
+            const dryRun = Boolean(req.body?.dryRun);
+
+            if (usernames.length === 0) {
+                return sendResponse(res, false, 400, "usernames[] is required", { errors: ["usernames is required"] });
+            }
+            if (!Number.isFinite(profileId) || profileId <= 0) {
+                return sendResponse(res, false, 400, "profileId is required", { errors: ["profileId must be a positive integer"] });
+            }
+            if (usernames.length > 500) {
+                return sendResponse(res, false, 400, "Too many usernames", { errors: ["Max 500 usernames per request"] });
+            }
+
+            const profileRepo = AppDataSource.getRepository(Radprofile);
+            const profile = await profileRepo.findOne({ where: { id: profileId } as any });
+            if (!profile) {
+                return sendResponse(res, false, 404, "Profile not found");
+            }
+
+            const userRepo = AppDataSource.getRepository(Raduserprofile);
+            const qb = userRepo.createQueryBuilder("u").select(["u.username", "u.profileId"]);
+            qb.where("u.username IN (:...usernames)", { usernames });
+            if (isReseller) qb.andWhere("u.ownerResellerId = :rid", { rid: resellerId });
+            const existing = await qb.getRawMany<{ u_username: string; u_profileId: number }>();
+
+            const matched = existing.map((r) => r.u_username);
+            const matchedSet = new Set(matched);
+            const notFound = usernames.filter((u) => !matchedSet.has(u));
+
+            const alreadyOnProfile = existing.filter((r) => Number(r.u_profileId) === profileId).map((r) => r.u_username);
+            const willUpdate = matched.filter((u) => !alreadyOnProfile.includes(u));
+
+            if (dryRun) {
+                await writeAuditLog({
+                    req,
+                    action: "users.bulk.assignProfile",
+                    targetUsernames: matched,
+                    meta: { dryRun: true, profileId },
+                });
+                return sendResponse(res, true, 200, "Bulk assign profile (dry run)", {
+                    dryRun: true,
+                    requested: usernames.length,
+                    matched: matched.length,
+                    willUpdate: willUpdate.length,
+                    skipped: matched.length - willUpdate.length,
+                    notFound,
+                });
+            }
+
+            if (willUpdate.length > 0) {
+                const up = userRepo
+                    .createQueryBuilder()
+                    .update(Raduserprofile)
+                    .set({ profileId });
+                up.where("username IN (:...usernames)", { usernames: willUpdate });
+                if (isReseller) up.andWhere("ownerResellerId = :rid", { rid: resellerId });
+                await up.execute();
+            }
+
+            await deleteCacheKeys();
+            await writeAuditLog({
+                req,
+                action: "users.bulk.assignProfile",
+                targetUsernames: matched,
+                meta: { dryRun: false, profileId, updated: willUpdate.length, skipped: matched.length - willUpdate.length },
+            });
+
+            return sendResponse(res, true, 200, "Bulk assign profile complete", {
+                dryRun: false,
+                requested: usernames.length,
+                matched: matched.length,
+                updated: willUpdate.length,
+                skipped: matched.length - willUpdate.length,
+                notFound,
+            });
+        } catch (e: any) {
+            console.error("bulkAssignProfile failed:", e);
+            return sendResponse(res, false, 500, "Bulk assign profile failed");
+        }
+    },
+
+    bulkSetStatus: async (req: Request, res: Response) => {
+        try {
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const usernames = normalizeUsernames(req.body?.usernames);
+            const accountStatus = String(req.body?.accountStatus ?? "").trim();
+            const dryRun = Boolean(req.body?.dryRun);
+
+            const allowed = new Set(["active", "suspended", "terminated"]);
+
+            if (usernames.length === 0) {
+                return sendResponse(res, false, 400, "usernames[] is required", { errors: ["usernames is required"] });
+            }
+            if (!allowed.has(accountStatus)) {
+                return sendResponse(res, false, 400, "Invalid accountStatus", { errors: ["accountStatus must be one of: active, suspended, terminated"] });
+            }
+            if (usernames.length > 500) {
+                return sendResponse(res, false, 400, "Too many usernames", { errors: ["Max 500 usernames per request"] });
+            }
+
+            const userRepo = AppDataSource.getRepository(Raduserprofile);
+            const qb = userRepo.createQueryBuilder("u").select(["u.username", "u.accountStatus"]);
+            qb.where("u.username IN (:...usernames)", { usernames });
+            if (isReseller) qb.andWhere("u.ownerResellerId = :rid", { rid: resellerId });
+            const existing = await qb.getRawMany<{ u_username: string; u_account_status: string | null }>();
+
+            const matched = existing.map((r) => r.u_username);
+            const matchedSet = new Set(matched);
+            const notFound = usernames.filter((u) => !matchedSet.has(u));
+
+            const already = existing.filter((r) => String(r.u_account_status ?? "").trim() === accountStatus).map((r) => r.u_username);
+            const willUpdate = matched.filter((u) => !already.includes(u));
+
+            if (dryRun) {
+                await writeAuditLog({
+                    req,
+                    action: "users.bulk.setStatus",
+                    targetUsernames: matched,
+                    meta: { dryRun: true, accountStatus },
+                });
+                return sendResponse(res, true, 200, "Bulk set status (dry run)", {
+                    dryRun: true,
+                    requested: usernames.length,
+                    matched: matched.length,
+                    willUpdate: willUpdate.length,
+                    skipped: matched.length - willUpdate.length,
+                    notFound,
+                });
+            }
+
+            if (willUpdate.length > 0) {
+                const up = userRepo
+                    .createQueryBuilder()
+                    .update(Raduserprofile)
+                    .set({ accountStatus });
+                up.where("username IN (:...usernames)", { usernames: willUpdate });
+                if (isReseller) up.andWhere("ownerResellerId = :rid", { rid: resellerId });
+                await up.execute();
+            }
+
+            await deleteCacheKeys();
+            await writeAuditLog({
+                req,
+                action: "users.bulk.setStatus",
+                targetUsernames: matched,
+                meta: { dryRun: false, accountStatus, updated: willUpdate.length, skipped: matched.length - willUpdate.length },
+            });
+
+            return sendResponse(res, true, 200, "Bulk set status complete", {
+                dryRun: false,
+                requested: usernames.length,
+                matched: matched.length,
+                updated: willUpdate.length,
+                skipped: matched.length - willUpdate.length,
+                notFound,
+            });
+        } catch (e: any) {
+            console.error("bulkSetStatus failed:", e);
+            return sendResponse(res, false, 500, "Bulk set status failed");
+        }
+    },
+
+    bulkResetMac: async (req: Request, res: Response) => {
+        try {
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const usernames = normalizeUsernames(req.body?.usernames);
+            const dryRun = Boolean(req.body?.dryRun);
+
+            if (usernames.length === 0) {
+                return sendResponse(res, false, 400, "usernames[] is required", { errors: ["usernames is required"] });
+            }
+            if (usernames.length > 500) {
+                return sendResponse(res, false, 400, "Too many usernames", { errors: ["Max 500 usernames per request"] });
+            }
+
+            // Scope usernames to reseller ownership if needed
+            let allowedUsernames = usernames;
+            if (isReseller) {
+                const userRepo = AppDataSource.getRepository(Raduserprofile);
+                const rows = await userRepo
+                    .createQueryBuilder("u")
+                    .select(["u.username"])
+                    .where("u.username IN (:...usernames)", { usernames })
+                    .andWhere("u.ownerResellerId = :rid", { rid: resellerId })
+                    .getRawMany<{ u_username: string }>();
+                allowedUsernames = rows.map((r) => r.u_username);
+            }
+
+            const allowedSet = new Set(allowedUsernames);
+            const notFoundOrNotOwned = usernames.filter((u) => !allowedSet.has(u));
+
+            const userMacRepo = AppDataSource.getRepository(UserMac);
+            const existingMacRows = await userMacRepo
+                .createQueryBuilder("m")
+                .select(["m.username"])
+                .where("m.username IN (:...usernames)", { usernames: allowedUsernames })
+                .getRawMany<{ m_username: string }>();
+            const withMac = existingMacRows.map((r) => r.m_username);
+
+            if (dryRun) {
+                await writeAuditLog({
+                    req,
+                    action: "users.bulk.resetMac",
+                    targetUsernames: allowedUsernames,
+                    meta: { dryRun: true, willDelete: withMac.length },
+                });
+                return sendResponse(res, true, 200, "Bulk reset MAC (dry run)", {
+                    dryRun: true,
+                    requested: usernames.length,
+                    matched: allowedUsernames.length,
+                    willDelete: withMac.length,
+                    notFound: notFoundOrNotOwned,
+                });
+            }
+
+            let deleted = 0;
+            if (withMac.length > 0) {
+                const result = await userMacRepo
+                    .createQueryBuilder()
+                    .delete()
+                    .from(UserMac)
+                    .where("username IN (:...usernames)", { usernames: withMac })
+                    .execute();
+                deleted = result.affected ?? 0;
+            }
+
+            await deleteCacheKeys();
+            await writeAuditLog({
+                req,
+                action: "users.bulk.resetMac",
+                targetUsernames: allowedUsernames,
+                meta: { dryRun: false, deleted },
+            });
+
+            return sendResponse(res, true, 200, "Bulk reset MAC complete", {
+                dryRun: false,
+                requested: usernames.length,
+                matched: allowedUsernames.length,
+                deleted,
+                notFound: notFoundOrNotOwned,
+            });
+        } catch (e: any) {
+            console.error("bulkResetMac failed:", e);
+            return sendResponse(res, false, 500, "Bulk reset MAC failed");
+        }
+    },
+
+    bulkDeleteUsers: async (req: Request, res: Response) => {
+        try {
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const usernames = normalizeUsernames(req.body?.usernames);
+            const dryRun = Boolean(req.body?.dryRun);
+
+            if (usernames.length === 0) {
+                return sendResponse(res, false, 400, "usernames[] is required", { errors: ["usernames is required"] });
+            }
+            if (usernames.length > 200) {
+                // Deletions can cascade; keep conservative.
+                return sendResponse(res, false, 400, "Too many usernames", { errors: ["Max 200 usernames per request"] });
+            }
+
+            const userRepo = AppDataSource.getRepository(Raduserprofile);
+            const qb = userRepo.createQueryBuilder("u").select(["u.id", "u.username"]);
+            qb.where("u.username IN (:...usernames)", { usernames });
+            if (isReseller) qb.andWhere("u.ownerResellerId = :rid", { rid: resellerId });
+            const rows = await qb.getRawMany<{ u_id: number; u_username: string }>();
+
+            const matchedUsernames = rows.map((r) => r.u_username);
+            const matchedSet = new Set(matchedUsernames);
+            const notFound = usernames.filter((u) => !matchedSet.has(u));
+            const ids = rows.map((r) => Number(r.u_id)).filter((n) => Number.isFinite(n));
+
+            if (dryRun) {
+                await writeAuditLog({
+                    req,
+                    action: "users.bulk.delete",
+                    targetUsernames: matchedUsernames,
+                    meta: { dryRun: true, matched: matchedUsernames.length, notFoundCount: notFound.length },
+                });
+                return sendResponse(res, true, 200, "Bulk delete users (dry run)", {
+                    dryRun: true,
+                    requested: usernames.length,
+                    matched: matchedUsernames.length,
+                    willDelete: matchedUsernames.length,
+                    notFound,
+                });
+            }
+
+            let deleted = 0;
+            await AppDataSource.transaction(async (mgr) => {
+                const invoicesRepo = mgr.getRepository(Invoices);
+                const userDetailsRepo = mgr.getRepository(UserDetails);
+                const radcheckRepo = mgr.getRepository(Radcheck);
+                const userMacRepo = mgr.getRepository(UserMac);
+                const raduserRepo = mgr.getRepository(Raduserprofile);
+
+                if (ids.length > 0) {
+                    await invoicesRepo
+                        .createQueryBuilder()
+                        .delete()
+                        .where("user_profile_id IN (:...ids)", { ids })
+                        .execute();
+                }
+
+                if (matchedUsernames.length > 0) {
+                    await userDetailsRepo
+                        .createQueryBuilder()
+                        .delete()
+                        .where("username IN (:...usernames)", { usernames: matchedUsernames })
+                        .execute();
+
+                    await userMacRepo
+                        .createQueryBuilder()
+                        .delete()
+                        .where("username IN (:...usernames)", { usernames: matchedUsernames })
+                        .execute();
+
+                    await radcheckRepo
+                        .createQueryBuilder()
+                        .delete()
+                        .where("username IN (:...usernames)", { usernames: matchedUsernames })
+                        .execute();
+                }
+
+                if (ids.length > 0) {
+                    const result = await raduserRepo
+                        .createQueryBuilder()
+                        .delete()
+                        .from(Raduserprofile)
+                        .where("id IN (:...ids)", { ids })
+                        .execute();
+                    deleted = result.affected ?? 0;
+                }
+            });
+
+            await deleteCacheKeys();
+            for (const u of matchedUsernames) {
+                try {
+                    await redisClient.del(`user:${u}`);
+                } catch {}
+            }
+
+            await writeAuditLog({
+                req,
+                action: "users.bulk.delete",
+                targetUsernames: matchedUsernames,
+                meta: { dryRun: false, deleted, notFoundCount: notFound.length },
+            });
+
+            return sendResponse(res, true, 200, "Bulk delete users complete", {
+                dryRun: false,
+                requested: usernames.length,
+                matched: matchedUsernames.length,
+                deleted,
+                notFound,
+            });
+        } catch (e: any) {
+            console.error("bulkDeleteUsers failed:", e);
+            return sendResponse(res, false, 500, "Bulk delete users failed");
+        }
+    },
+
+    bulkCreateUsers: async (req: Request, res: Response) => {
+        try {
+            const usersRaw = (req.body as any)?.users;
+            const dryRun = Boolean((req.body as any)?.dryRun);
+            if (!Array.isArray(usersRaw) || usersRaw.length === 0) {
+                return sendResponse(res, false, 400, "users array is required");
+            }
+            if (usersRaw.length > 500) {
+                return sendResponse(res, false, 400, "Too many users (max 500 per request)");
+            }
+
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const userRepository = AppDataSource.getRepository(Raduserprofile);
+            const radcheckRepository = AppDataSource.getRepository(Radcheck);
+            const userDetailsRepository = AppDataSource.getRepository(UserDetails);
+
+            const payload = usersRaw.map((u: any) => ({
+                username: String(u?.username ?? "").trim(),
+                password: String(u?.password ?? "").trim(),
+                profileId: Number(u?.profileId),
+                accountStatus: String(u?.accountStatus ?? "active"),
+                quotaResetDay: u?.quotaResetDay === undefined || u?.quotaResetDay === null ? null : Number(u.quotaResetDay),
+                fullName: u?.fullName === undefined ? undefined : String(u.fullName ?? "").trim(),
+                address: u?.address === undefined ? undefined : String(u.address ?? "").trim(),
+                phoneNumber: u?.phoneNumber === undefined ? undefined : String(u.phoneNumber ?? "").trim(),
+                email: u?.email === undefined ? undefined : String(u.email ?? "").trim(),
+            }));
+
+            const seen = new Set<string>();
+            const results: Array<{ username: string; ok: boolean; error?: string }> = [];
+
+            for (const u of payload) {
+                if (!u.username) {
+                    results.push({ username: "", ok: false, error: "username is required" });
+                    continue;
+                }
+                if (seen.has(u.username)) {
+                    results.push({ username: u.username, ok: false, error: "duplicate username in request" });
+                    continue;
+                }
+                seen.add(u.username);
+
+                if (!u.password) {
+                    results.push({ username: u.username, ok: false, error: "password is required" });
+                    continue;
+                }
+                if (!Number.isFinite(u.profileId) || u.profileId <= 0) {
+                    results.push({ username: u.username, ok: false, error: "profileId must be a positive number" });
+                    continue;
+                }
+                if (!["active", "suspended", "terminated"].includes(u.accountStatus)) {
+                    results.push({ username: u.username, ok: false, error: "accountStatus must be active|suspended|terminated" });
+                    continue;
+                }
+                if (u.quotaResetDay !== null) {
+                    if (!Number.isFinite(u.quotaResetDay) || u.quotaResetDay < 1 || u.quotaResetDay > 31) {
+                        results.push({ username: u.username, ok: false, error: "quotaResetDay must be 1..31" });
+                        continue;
+                    }
+                }
+
+                results.push({ username: u.username, ok: true });
+            }
+
+            const candidates = results.filter((r) => r.ok).map((r) => r.username);
+            if (candidates.length === 0) {
+                await writeAuditLog({
+                    req,
+                    action: "users.bulk.create",
+                    targetUsernames: [],
+                    meta: { dryRun, requested: payload.length, created: 0, failed: payload.length },
+                });
+                return sendResponse(res, true, 200, "Bulk create validated", { dryRun, results, created: 0, failed: results.filter((r) => !r.ok).length });
+            }
+
+            const existingUsers = await userRepository
+                .createQueryBuilder("u")
+                .select("u.username", "username")
+                .where("u.username IN (:...usernames)", { usernames: candidates })
+                .getRawMany<{ username: string }>();
+
+            const existingRadcheck = await radcheckRepository
+                .createQueryBuilder("rc")
+                .select("rc.username", "username")
+                .where("rc.username IN (:...usernames)", { usernames: candidates })
+                .getRawMany<{ username: string }>();
+
+            const existing = new Set<string>([
+                ...existingUsers.map((x) => x.username),
+                ...existingRadcheck.map((x) => x.username),
+            ]);
+
+            const finalResults = results.map((r) => {
+                if (!r.ok) return r;
+                if (existing.has(r.username)) return { username: r.username, ok: false, error: "User already exists" };
+                return r;
+            });
+
+            const toCreate = payload.filter((u) => finalResults.some((r) => r.ok && r.username === u.username));
+
+            if (dryRun) {
+                await writeAuditLog({
+                    req,
+                    action: "users.bulk.create",
+                    targetUsernames: toCreate.map((u) => u.username),
+                    meta: { dryRun: true, requested: payload.length, wouldCreate: toCreate.length, failed: finalResults.filter((r) => !r.ok).length },
+                });
+                return sendResponse(res, true, 200, "Bulk create dry-run", {
+                    dryRun: true,
+                    results: finalResults,
+                    wouldCreate: toCreate.length,
+                    failed: finalResults.filter((r) => !r.ok).length,
+                });
+            }
+
+            let created = 0;
+            let failed = finalResults.filter((r) => !r.ok).length;
+
+            const createdUsernames: string[] = [];
+
+            for (const u of toCreate) {
+                try {
+                    await AppDataSource.transaction(async (manager) => {
+                        const radcheck = new Radcheck();
+                        radcheck.username = u.username;
+                        radcheck.attribute = 'Cleartext-Password';
+                        radcheck.op = ':=';
+                        radcheck.value = u.password;
+                        await manager.save(Radcheck, radcheck);
+
+                        const user = new Raduserprofile();
+                        user.username = u.username;
+                        user.profileId = u.profileId;
+                        user.isFallback = false;
+                        user.isMonthlyExceeded = false;
+                        user.quotaResetDay = u.quotaResetDay || new Date().getDate();
+                        user.accountStatus = u.accountStatus as any;
+                        if (isReseller && resellerId) {
+                            (user as any).ownerResellerId = resellerId;
+                        }
+                        await manager.save(Raduserprofile, user);
+
+                        const userDetails = new UserDetails();
+                        userDetails.username = u.username;
+                        if (u.fullName !== undefined) userDetails.fullName = u.fullName || null;
+                        if (u.address !== undefined) userDetails.address = u.address || null;
+                        if (u.phoneNumber !== undefined) userDetails.phoneNumber = u.phoneNumber || null;
+                        if (u.email !== undefined) userDetails.email = u.email || null;
+                        await manager.save(UserDetails, userDetails);
+                    });
+
+                    created += 1;
+                    createdUsernames.push(u.username);
+                } catch (e: any) {
+                    failed += 1;
+                    // mark finalResults entry as failed
+                    const idx = finalResults.findIndex((r) => r.username === u.username);
+                    if (idx >= 0) finalResults[idx] = { username: u.username, ok: false, error: e?.message || "Failed to create user" };
+                }
+            }
+
+            if (created > 0) {
+                await deleteCacheKeys();
+            }
+
+            await writeAuditLog({
+                req,
+                action: "users.bulk.create",
+                targetUsernames: createdUsernames,
+                meta: { dryRun: false, requested: payload.length, created, failed },
+            });
+
+            return sendResponse(res, true, 201, "Bulk create completed", { dryRun: false, results: finalResults, created, failed });
+        } catch (e) {
+            console.error("bulkCreateUsers failed:", e);
+            return sendResponse(res, false, 500, "Error creating users");
+        }
+    },
 };
 
 
