@@ -4,6 +4,9 @@ FROM node:20-alpine
 # Set working directory
 WORKDIR /app
 
+# MySQL client tools (provides `mysqldump` on Alpine)
+RUN apk add --no-cache mysql-client
+
 # Copy package.json and lock file
 COPY package*.json ./
 

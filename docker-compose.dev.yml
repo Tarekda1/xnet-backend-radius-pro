@@ -20,6 +20,7 @@ services:
       - DB_USERNAME=${DB_USERNAME:-radius}
       - DB_PASSWORD=${DB_PASSWORD:-password}
       - DB_NAME=${DB_NAME:-radius}
+      - BACKUP_MYSQLDUMP_PATH=${BACKUP_MYSQLDUMP_PATH:-/usr/bin/mysqldump}
       # WhatsApp template settings (for Cloud API fallback)
       - WHATSAPP_TEMPLATE_NAME=${WHATSAPP_TEMPLATE_NAME:-payment_confirmation}
       - WHATSAPP_TEMPLATE_LANGUAGE_CODE=${WHATSAPP_TEMPLATE_LANGUAGE_CODE:-en_US}

@@ -53,8 +53,7 @@ export class QuotaService {
       await this.eventBus.publish({
         action: 'disconnectAndCompleteSession',
         username,
-        ip: '172.8.16.2',
-        code: 'tisp123'
+        reason: 'dailyQuotaReset'
       });
     } catch (error) {
       console.error('Error resetting daily quota:', error);

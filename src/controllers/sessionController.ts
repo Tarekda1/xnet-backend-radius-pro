@@ -158,8 +158,8 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
     tomorrowStart.setDate(tomorrowStart.getDate() + 1);
 
     const firstDayOfMonth = new Date(today);
-    firstDayOfMonth.setDate(1); // Get the first day of the month
-    const firstDayOfMonthStr = firstDayOfMonth.toISOString().split("T")[0];
+    firstDayOfMonth.setDate(1);
+    const firstDayOfMonthStr = firstDayOfMonth.toISOString().split("T")[0]; // YYYY-MM-DD
 
     // 🔹 Get pagination parameters
     let page = parseInt(req.query.page as string) || 1;
@@ -254,8 +254,10 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
             "SUM(monthlyUsage.data_usage) AS monthly_usage"
           ])
           .where("monthlyUsage.day BETWEEN :firstDayOfMonth AND :today", { firstDayOfMonth: firstDayOfMonthStr, today })
-          .groupBy("monthlyUsage.username")
-        , "monthlyUsage", "session.username = monthlyUsage.monthly_username")
+          .groupBy("monthlyUsage.username"),
+        "monthlyUsage",
+        "session.username = monthlyUsage.monthly_username"
+      )
       .leftJoin(Raduserprofile, "userProfile", "session.username = userProfile.username")
       .leftJoin(Radprofile, "profile", "userProfile.profileId = profile.id")
       .leftJoinAndMapOne(
@@ -409,6 +411,14 @@ export const getUserSessions = async (req: Request, res: Response) => {
       .createQueryBuilder("ra")
       .where("ra.username = :username", { username });
 
+    // Prefer session_tracking counters (can be 64-bit) when available,
+    // because radacct octets can under/over-report depending on NAS counters & schema.
+    baseQb.leftJoin(
+      SessionTracking,
+      "st",
+      "st.session_id = ra.acctsessionid AND st.username = ra.username"
+    );
+
     // Reseller scoping: user must belong to the reseller
     if (isReseller) {
       baseQb.innerJoin(
@@ -433,9 +443,9 @@ export const getUserSessions = async (req: Request, res: Response) => {
         "ra.acctstarttime AS start_time",
         "ra.acctstoptime AS stop_time",
         "ra.acctsessiontime AS session_time",
-        "COALESCE(ra.acctinputoctets, 0) AS bytes_in",
-        "COALESCE(ra.acctoutputoctets, 0) AS bytes_out",
-        "(COALESCE(ra.acctinputoctets, 0) + COALESCE(ra.acctoutputoctets, 0)) AS total_bytes",
+        "COALESCE(st.bytes_in, ra.acctinputoctets, 0) AS bytes_in",
+        "COALESCE(st.bytes_out, ra.acctoutputoctets, 0) AS bytes_out",
+        "(COALESCE(st.bytes_in, ra.acctinputoctets, 0) + COALESCE(st.bytes_out, ra.acctoutputoctets, 0)) AS total_bytes",
       ])
       .orderBy("ra.acctstarttime", "DESC")
       .limit(limit)
@@ -462,18 +472,43 @@ export const getUserSessions = async (req: Request, res: Response) => {
 
 export const disconnectOnlineUser = async (req: Request, res: Response) => {
   try {
-    const { username, ip, code, port } = req.body || {};
+    const username = String(req.body?.username ?? "").trim();
+    const ip = req.body?.ip;
+    const code = req.body?.code;
+    const port = req.body?.port;
 
-    if (!username || !ip || !code) {
-      res.status(400).json({ success: false, message: "username, ip and code are required" });
+    if (!username) {
+      res.status(400).json({ success: false, message: "username is required" });
+      return;
+    }
+
+    // Reseller scoping: reseller can only disconnect their own users
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    if (isReseller) {
+      const uRepo = AppDataSource.getRepository(Raduserprofile);
+      const u = await uRepo.findOne({ where: { username, ownerResellerId: resellerId } as any });
+      if (!u) {
+        res.status(404).json({ success: false, message: "User not found" });
+        return;
+      }
     }
 
     await eventBus.publish({
       action: "disconnectAndCompleteSession",
       username,
-      ip,
-      code,
-      port: typeof port === "number" ? port : undefined,
+      reason: "manualDisconnect",
+      // Backwards-compat: if caller passes NAS ip/secret, the consumer can fall back to radclient
+      ...(ip && code
+        ? {
+            ip,
+            code,
+            port: typeof port === "number" ? port : undefined,
+          }
+        : {}),
     });
 
     res.status(202).json({ success: true, message: "Disconnect scheduled" });

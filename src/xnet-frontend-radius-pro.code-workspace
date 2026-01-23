@@ -11,6 +11,9 @@
         },
         {
             "path": "../../xnet-invoices-mobile"
+        },
+        {
+            "path": "../../deployment"
         }
     ]
 }

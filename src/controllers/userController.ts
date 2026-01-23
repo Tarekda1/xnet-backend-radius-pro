@@ -13,6 +13,7 @@ import { exec } from 'child_process';
 import eventBus from '../bus/eventBusSingleton';
 import { CacheService } from '../services/cacheService';
 import { QuotaService } from '../services/quotaServices';
+import { bandwidthService } from '../services/bandwidthService';
 import { UserDetails } from '../db/entities/UserDetails';
 import { SessionTracking } from '../db/entities/SessionTracking';
 import { Invoices } from '../db/entities/Invoices';
@@ -601,18 +602,34 @@ export const UserController = {
     },
     resetMonthlyQuota: async (req: Request, res: Response) => { },
     changeUserProfile: async (req: Request, res: Response) => { },
-    disconnectUser: (username: string, nasIp: string, secret: string, port: number = 1700) => {
-        const command = `echo "User-Name = ${username}" | radclient -x ${nasIp}:${port} disconnect ${secret}`;
+    // Disconnect a user from MikroTik so they re-auth and get their normal profile again.
+    // Prefer RouterOS API (PPPoE/Hotspot). The legacy radclient flow (nasIp/secret) is kept only for backwards compat.
+    disconnectUser: async (username: string, nasIp?: string, secret?: string, port?: number) => {
+        try {
+            const result = await bandwidthService.disconnectUser(username);
+            console.log(`✅ Disconnected ${username} via MikroTik API`, result);
+            return;
+        } catch (err: any) {
+            console.warn(`⚠️ MikroTik API disconnect failed for ${username}:`, err?.message || err);
+        }
+
+        // Legacy fallback: send RADIUS Disconnect-Request (requires nasIp + shared secret)
+        if (!nasIp || !secret) {
+            console.error(`❌ Cannot disconnect ${username}: missing nasIp/secret and MikroTik API failed/unavailable`);
+            return;
+        }
+        const coaPort = typeof port === "number" ? port : 3799; // MikroTik default for CoA/DM
+        const command = `echo "User-Name = ${username}" | radclient -x ${nasIp}:${coaPort} disconnect ${secret}`;
 
         exec(command, (error, stdout, stderr) => {
             if (error) {
-                console.error(`❌ Error disconnecting user ${username}:`, error.message);
+                console.error(`❌ Error disconnecting user ${username} via radclient:`, error.message);
                 return;
             }
             if (stderr) {
                 console.error(`⚠️ Warning: ${stderr}`);
             }
-            console.log(`✅ User ${username} disconnected successfully:`, stdout);
+            console.log(`✅ User ${username} disconnected via radclient:`, stdout);
         });
     },
     searchUsers: async (req: Request, res: Response) => {

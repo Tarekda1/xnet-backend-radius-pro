@@ -42,7 +42,8 @@ export class BandwidthService {
 
   constructor() {
     this.routerIP = process.env.MIKROTIK_IP || '172.9.16.2';
-    this.username = process.env.MIKROTIK_USERNAME || 'apiuser';
+    // Backwards-compat: some envs use MIKROTIK_USER
+    this.username = process.env.MIKROTIK_USERNAME || process.env.MIKROTIK_USER || 'apiuser';
     this.password = process.env.MIKROTIK_PASSWORD || '123456';
     this.apiPort = parseInt(process.env.MIKROTIK_API_PORT || '8728');
     this.monitorInterface = process.env.MIKROTIK_MONITOR_INTERFACE || 'ether6-OUT';
@@ -248,6 +249,44 @@ export class BandwidthService {
       };
     }
     return { username, isOnline: false };
+  }
+
+  /* ------------------------------------------------------------------
+   * Disconnect user (PPP + Hotspot)
+   * ------------------------------------------------------------------*/
+  async disconnectUser(username: string): Promise<{ pppRemoved: number; hotspotRemoved: number }> {
+    if (!username || !String(username).trim()) {
+      throw new Error("username is required");
+    }
+    if (this.mockMode) {
+      logger.warn(`BandwidthService.disconnectUser(${username}) in MOCK MODE – no action taken`);
+      return { pppRemoved: 0, hotspotRemoved: 0 };
+    }
+
+    await this.ensureConnection();
+
+    let pppRemoved = 0;
+    let hotspotRemoved = 0;
+
+    // PPP sessions (PPPoE / PPTP / etc.)
+    const pppActive = await this.conn.write('/ppp/active/print', [`?name=${username}`]).catch(() => []);
+    for (const s of pppActive) {
+      const id = s?.['.id'];
+      if (!id) continue;
+      await this.conn.write('/ppp/active/remove', [`=.id=${id}`]).catch(() => null);
+      pppRemoved += 1;
+    }
+
+    // Hotspot sessions
+    const hsActive = await this.conn.write('/ip/hotspot/active/print', [`?user=${username}`]).catch(() => []);
+    for (const s of hsActive) {
+      const id = s?.['.id'];
+      if (!id) continue;
+      await this.conn.write('/ip/hotspot/active/remove', [`=.id=${id}`]).catch(() => null);
+      hotspotRemoved += 1;
+    }
+
+    return { pppRemoved, hotspotRemoved };
   }
 
   /* ------------------------------------------------------------------

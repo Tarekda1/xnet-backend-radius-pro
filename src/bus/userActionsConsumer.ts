@@ -17,10 +17,10 @@ export async function startConsumer() {
     if (msg !== null) {
       const message = JSON.parse(msg.content.toString());
       if (message.action === 'disconnectAndCompleteSession') {
-        const { username, ip, code } = message;
+        const { username, ip, code, port } = message;
         const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
         // Disconnect the user
-        await UserController.disconnectUser(username, ip, code);
+        await UserController.disconnectUser(username, ip, code, typeof port === "number" ? port : undefined);
         await delay(5000); 
         // Update session_tracking to mark active session as completed
         const queryRunner = AppDataSource.createQueryRunner();

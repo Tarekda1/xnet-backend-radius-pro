@@ -33,6 +33,7 @@ import expenseRoutes from './routes/expenseRoutes';
 import accessRoutes from './routes/accessRoutes';
 import resellerRoutes from './routes/resellerRoutes';
 import auditRoutes from './routes/auditRoutes';
+import backupRoutes from './routes/backupRoutes';
 import './events/invoiceListeners'
 import cors from 'cors';
 import eventBus from './bus/eventBusSingleton';
@@ -40,6 +41,7 @@ import { beginShutdown } from './state/shutdown';
 import { redisClient } from './redisClient';
 import { AppDataSource } from './db/config';
 import { metricsMiddleware, register, setWebsocketClients } from './metrics/metrics';
+import { startBackupScheduler } from "./backups/scheduler";
 
 dotenv.config();
 
@@ -182,6 +184,8 @@ app.use("/api", auditRoutes);
 
 app.use("/api", resellerRoutes);
 
+app.use("/api", backupRoutes);
+
 const monthlyInvoiceTask = cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
     await generateMonthlyInvoices();
@@ -277,6 +281,8 @@ startConsumer().catch((err) => console.error('Consumer error:', err));
 
 // Initialize database before starting server
 initializeDB().then(() => {
+    // Start scheduled backup jobs (if env cron vars are set)
+    startBackupScheduler(app);
     server.listen(process.env.PORT || 3000, () => {
         console.log(`Server is running on http://localhost:${process.env.PORT || 3000}`);
     });
