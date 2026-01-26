@@ -1,6 +1,10 @@
 import { DataSource } from 'typeorm';
 import 'reflect-metadata';
 import { SessionTrackingSubscriber } from './subscribers/sessionTrackingSubscriber';
+import dotenv from "dotenv";
+
+// Ensure CLI commands (typeorm migrations) also load .env
+dotenv.config();
 
 // Import all entities directly for Docker compatibility
 import { BlockedMacs } from './entities/BlockedMacs';

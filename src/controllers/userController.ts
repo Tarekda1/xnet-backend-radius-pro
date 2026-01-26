@@ -10,6 +10,9 @@ import { Radcheck } from '../db/entities/Radcheck';
 import { Logs } from '../db/entities/Logs';
 import { promisify } from "util";
 import { exec } from 'child_process';
+import util from "util";
+import radius from "radius";
+import dgram from "dgram";
 import eventBus from '../bus/eventBusSingleton';
 import { CacheService } from '../services/cacheService';
 import { QuotaService } from '../services/quotaServices';
@@ -17,6 +20,8 @@ import { bandwidthService } from '../services/bandwidthService';
 import { UserDetails } from '../db/entities/UserDetails';
 import { SessionTracking } from '../db/entities/SessionTracking';
 import { Invoices } from '../db/entities/Invoices';
+import { Radacct } from '../db/entities/Radacct';
+import { Nas } from '../db/entities/Nas';
 
 
 
@@ -153,6 +158,106 @@ async function getFreshUsersStatusMap(
         };
         return acc;
     }, {} as Record<string, { isOnline: boolean; lastTimeActive: any }>);
+}
+
+function formatMikrotikRateLimitKbps(speedDown: number | null | undefined, speedUp: number | null | undefined): string {
+    const down = typeof speedDown === "number" && Number.isFinite(speedDown) && speedDown > 0 ? Math.floor(speedDown) : 0;
+    const up = typeof speedUp === "number" && Number.isFinite(speedUp) && speedUp > 0 ? Math.floor(speedUp) : 0;
+    // Keep the same order as the MikroTik queue you reported: "download/upload"
+    return `${down}k/${up}k`;
+}
+
+async function getActiveRadiusSession(username: string): Promise<{
+    acctSessionId: string;
+    nasIp: string;
+    framedIp: string | null;
+} | null> {
+    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+
+    const row = await AppDataSource.getRepository(Radacct)
+        .createQueryBuilder("ra")
+        .select([
+            "ra.acctsessionid AS acctSessionId",
+            "ra.nasipaddress AS nasIp",
+            "ra.framedipaddress AS framedIp",
+        ])
+        .where("ra.username = :username", { username })
+        .andWhere("ra.acctstoptime IS NULL")
+        .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
+        .orderBy("COALESCE(ra.acctupdatetime, ra.acctstarttime)", "DESC")
+        .getRawOne<{ acctSessionId: string; nasIp: string; framedIp: string | null }>();
+
+    if (!row?.acctSessionId || !row?.nasIp) return null;
+    return { acctSessionId: row.acctSessionId, nasIp: row.nasIp, framedIp: row.framedIp ?? null };
+}
+
+function safeIntDayOfMonth(input: any): number {
+    const n = typeof input === "number" ? input : parseInt(String(input ?? ""), 10);
+    // keep within 1..31; mysql DATE_FORMAT(%Y-%m-) + day string expects 2 digits
+    if (!Number.isFinite(n)) return 1;
+    return Math.min(31, Math.max(1, Math.floor(n)));
+}
+
+function todayYyyyMmDd(): string {
+    // Works for MySQL DATE comparisons in this project (YYYY-MM-DD).
+    return new Date().toISOString().slice(0, 10);
+}
+
+function currentMonthResetStart(resetDay: number | null | undefined): string {
+    const d = safeIntDayOfMonth(resetDay ?? 1);
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const dd = String(d).padStart(2, "0");
+    // NOTE: this intentionally matches the existing FreeRADIUS monthly window logic:
+    // DATE_FORMAT(NOW(), CONCAT('%Y-%m-', LPAD(quota_reset_day,2,'0')))
+    return `${yyyy}-${mm}-${dd}`;
+}
+
+async function getQuotaUsageForUsers(usernames: string[]): Promise<Record<string, { dailyUsage: bigint; monthlyUsage: bigint }>> {
+    if (!Array.isArray(usernames) || usernames.length === 0) return {};
+    const today = todayYyyyMmDd();
+
+    // Build a parameterized IN clause.
+    const placeholders = usernames.map(() => "?").join(",");
+    const sql = `
+      SELECT
+        up.username AS username,
+        COALESCE(SUM(CASE WHEN s.day = CURDATE() THEN s.data_usage ELSE 0 END), 0) AS daily_usage,
+        COALESCE(SUM(CASE
+          WHEN s.day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
+          THEN s.data_usage ELSE 0 END), 0) AS monthly_usage
+      FROM raduserprofile up
+      LEFT JOIN radusagestats s
+        ON s.username = up.username
+      WHERE up.username IN (${placeholders})
+      GROUP BY up.username
+    `;
+
+    // Note: we don't pass "today" because we use CURDATE() in SQL for consistency.
+    const rows = await AppDataSource.query(sql, usernames);
+    return (rows as any[]).reduce((acc, r) => {
+        const u = String(r?.username ?? "");
+        if (!u) return acc;
+        const daily = BigInt(String(r?.daily_usage ?? "0"));
+        const monthly = BigInt(String(r?.monthly_usage ?? "0"));
+        acc[u] = { dailyUsage: daily, monthlyUsage: monthly };
+        return acc;
+    }, {} as Record<string, { dailyUsage: bigint; monthlyUsage: bigint }>);
+}
+
+function parseBigIntSafe(v: any): bigint {
+    try {
+        if (typeof v === "bigint") return v;
+        if (typeof v === "number" && Number.isFinite(v)) return BigInt(Math.floor(v));
+        const s = String(v ?? "0").trim();
+        if (!s.length) return BigInt(0);
+        return BigInt(s);
+    } catch {
+        return BigInt(0);
+    }
 }
 
 
@@ -434,6 +539,17 @@ export const UserController = {
                 await userDetailsRepository.save(userDetails);
 
                 await deleteCacheKeys(); // Invalidate cache
+                await writeAuditLog({
+                    req,
+                    action: "users.create",
+                    targetUsernames: [username],
+                    meta: {
+                        profileId,
+                        accountStatus: user.accountStatus,
+                        quotaResetDay: user.quotaResetDay,
+                        reseller: isReseller ? { resellerId } : null,
+                    },
+                });
                 sendResponse(res, true, 201, 'User created successfully');
             } catch (error) {
                 console.error(error);
@@ -470,6 +586,14 @@ export const UserController = {
             }
 
             const { username, password, profileId, accountStatus, fullName, address, phoneNumber, email } = req.body;
+            // Optional: force disconnect so user re-auths (drops session).
+            // This is NOT the default because CoA is usually sufficient and avoids disruptions.
+            const forceDisconnect =
+                String((req.body as any)?.disconnect ?? req.query?.disconnect ?? "")
+                    .trim()
+                    .toLowerCase() === "true" ||
+                String((req.body as any)?.disconnect ?? req.query?.disconnect ?? "")
+                    .trim() === "1";
 
             try {
                 const userRepository = AppDataSource.getRepository(Raduserprofile);
@@ -481,6 +605,8 @@ export const UserController = {
                 if (!user) {
                     return sendResponse(res, false, 404, "User not found");
                 }
+                const oldProfileId = user.profileId;
+                const oldAccountStatus = user.accountStatus;
 
                 // 🔹 Update password if provided
                 if (password) {
@@ -522,7 +648,92 @@ export const UserController = {
                 // 🔹 Invalidate all cached user pages
                 await deleteCacheKeys();
 
-                return sendResponse(res, true, 200, "User updated successfully");
+                // If profile changed (upgrade/downgrade), and the user was previously FUP,
+                // we want to clear fallback flags IF their current usage is now below the NEW plan quotas,
+                // and immediately apply the new plan speed via CoA (Option A).
+                let profileChange: any = null;
+                if (typeof profileId === "number" && Number.isFinite(profileId) && profileId > 0 && profileId !== oldProfileId) {
+                    try {
+                        const newProfile = await AppDataSource.getRepository(Radprofile).findOne({ where: { id: profileId } as any });
+                        if (!newProfile) {
+                            profileChange = { ok: false, error: "New profile not found" };
+                        } else {
+                            const usageMap = await getQuotaUsageForUsers([username]);
+                            const usage = usageMap[username] ?? { dailyUsage: BigInt(0), monthlyUsage: BigInt(0) };
+
+                            const dailyQuota = parseBigIntSafe((newProfile as any).dailyQuota);
+                            const monthlyQuota = parseBigIntSafe((newProfile as any).monthlyQuota);
+
+                            // Match existing RADIUS checks which use `>` (not >=) for exceeded.
+                            const dailyExceeded = usage.dailyUsage > dailyQuota;
+                            const monthlyExceeded = usage.monthlyUsage > monthlyQuota;
+                            const exceeded = dailyExceeded || monthlyExceeded;
+
+                            if (!exceeded) {
+                                // Clear fallback flags so backend + UI reflect that the user is no longer FUP.
+                                await userRepository.update(
+                                    { username },
+                                    { isFallback: false, isMonthlyExceeded: false } as any
+                                );
+                                // Apply the NEW speed to the active session via CoA (no disconnect).
+                                const coa = await UserController.applyProfileRateLimit(username);
+                                const disconnect = forceDisconnect ? await UserController.disconnectUser(username) : null;
+                                profileChange = {
+                                    ok: true,
+                                    clearedFallback: true,
+                                    dailyUsage: usage.dailyUsage.toString(),
+                                    monthlyUsage: usage.monthlyUsage.toString(),
+                                    dailyQuota: dailyQuota.toString(),
+                                    monthlyQuota: monthlyQuota.toString(),
+                                    coa,
+                                    disconnect,
+                                };
+                            } else {
+                                // Keep flags as-is (still exceeded under the new plan).
+                                // Update monthly flag to match new-plan evaluation (helps UI consistency).
+                                await userRepository.update(
+                                    { username },
+                                    { isMonthlyExceeded: monthlyExceeded } as any
+                                );
+                                profileChange = {
+                                    ok: true,
+                                    clearedFallback: false,
+                                    dailyUsage: usage.dailyUsage.toString(),
+                                    monthlyUsage: usage.monthlyUsage.toString(),
+                                    dailyQuota: dailyQuota.toString(),
+                                    monthlyQuota: monthlyQuota.toString(),
+                                    reason: "usage still exceeds new quotas",
+                                    disconnect: forceDisconnect ? await UserController.disconnectUser(username) : null,
+                                };
+                            }
+                        }
+                    } catch (e: any) {
+                        profileChange = { ok: false, error: e?.message || String(e) };
+                    }
+                }
+
+                // Audit: capture what changed (but never log password).
+                await writeAuditLog({
+                    req,
+                    action: "users.update",
+                    targetUsernames: [username],
+                    meta: {
+                        changed: {
+                            profileId: typeof profileId === "number" && Number.isFinite(profileId) ? { from: oldProfileId, to: profileId } : null,
+                            accountStatus: accountStatus ? { from: oldAccountStatus, to: accountStatus } : null,
+                            userDetails: {
+                                fullName: fullName !== undefined ? true : null,
+                                address: address !== undefined ? true : null,
+                                phoneNumber: phoneNumber !== undefined ? true : null,
+                                email: email !== undefined ? true : null,
+                            },
+                        },
+                        forceDisconnect,
+                        profileChange: profileChange ?? null,
+                    },
+                });
+
+                return sendResponse(res, true, 200, "User updated successfully", profileChange ? { profileChange } : null);
             } catch (error) {
                 console.error(error);
                 return sendResponse(res, false, 500, "Error updating user");
@@ -567,6 +778,12 @@ export const UserController = {
 
             await deleteCacheKeys();
             await redisClient.del(`user:${username}`); // Invalidate individual user cache
+            await writeAuditLog({
+                req,
+                action: "users.delete",
+                targetUsernames: [username],
+                meta: { deleted: true },
+            });
             sendResponse(res, true, 200, 'User deleted successfully');
         } catch (error) {
             console.error('Error deleting user:', error);
@@ -584,6 +801,12 @@ export const UserController = {
             await userMacRepository.remove(userMac);
             await deleteCacheKeys();
             await redisClient.del(`user:${username}`); // Invalidate individual user cache
+            await writeAuditLog({
+                req,
+                action: "users.resetMac",
+                targetUsernames: [username],
+                meta: { deleted: true },
+            });
             sendResponse(res, true, 200, 'MAC address reset successfully');
         } catch (error) {
             console.error(error);
@@ -594,43 +817,253 @@ export const UserController = {
         const { username } = req.params;
         try {
             await UserController.quotaService.resetDailyQuota(username);
+            await writeAuditLog({
+                req,
+                action: "users.resetDailyQuota",
+                targetUsernames: [username],
+            });
             sendResponse(res, true, 200, `✅ Daily quota reset successfully for ${username}`);
         } catch (error) {
             console.error(`❌ Error resetting daily quota for ${username}:`, error);
             sendResponse(res, false, 500, 'Error resetting daily quota');
         }
     },
-    resetMonthlyQuota: async (req: Request, res: Response) => { },
+    resetMonthlyQuota: async (req: Request, res: Response) => {
+        const { username } = req.params;
+        try {
+            await UserController.quotaService.resetMonthlyQuota(username);
+            await writeAuditLog({
+                req,
+                action: "users.resetMonthlyQuota",
+                targetUsernames: [username],
+            });
+            sendResponse(res, true, 200, `✅ Monthly quota reset successfully for ${username}`);
+        } catch (error) {
+            console.error(`❌ Error resetting monthly quota for ${username}:`, error);
+            sendResponse(res, false, 500, 'Error resetting monthly quota');
+        }
+    },
     changeUserProfile: async (req: Request, res: Response) => { },
     // Disconnect a user from MikroTik so they re-auth and get their normal profile again.
     // Prefer RouterOS API (PPPoE/Hotspot). The legacy radclient flow (nasIp/secret) is kept only for backwards compat.
-    disconnectUser: async (username: string, nasIp?: string, secret?: string, port?: number) => {
+    disconnectUser: async (
+        username: string,
+        nasIp?: string,
+        secret?: string,
+        port?: number
+    ): Promise<
+        | { ok: true; method: "mikrotik-api"; result: { pppRemoved: number; hotspotRemoved: number } }
+        | { ok: true; method: "radclient"; stdout: string; stderr: string }
+        | { ok: false; method: "none" | "radclient"; error: string; stdout?: string; stderr?: string }
+    > => {
+        const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
+            let t: NodeJS.Timeout | undefined;
+            try {
+                return await Promise.race([
+                    p,
+                    new Promise<T>((_resolve, reject) => {
+                        t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+                    }),
+                ]);
+            } finally {
+                if (t) clearTimeout(t);
+            }
+        };
+
+        let apiResult: { pppRemoved: number; hotspotRemoved: number } | null = null;
         try {
-            const result = await bandwidthService.disconnectUser(username);
-            console.log(`✅ Disconnected ${username} via MikroTik API`, result);
-            return;
+            // RouterOS API can hang if the device is unreachable; hard-timeout it.
+            apiResult = await withTimeout(bandwidthService.disconnectUser(username), 5000, "mikrotik disconnect");
+            // If we actually removed something, treat as success and stop here.
+            if ((apiResult.pppRemoved || 0) + (apiResult.hotspotRemoved || 0) > 0) {
+                console.log(`✅ Disconnected ${username} via MikroTik API`, apiResult);
+                return { ok: true, method: "mikrotik-api", result: apiResult };
+            }
+            // No active entry found via API. Fall back to DM if we have NAS info.
+            console.warn(`⚠️ MikroTik API did not find an active session for ${username} (pppRemoved=0, hotspotRemoved=0). Will try Disconnect-Request if possible.`);
         } catch (err: any) {
             console.warn(`⚠️ MikroTik API disconnect failed for ${username}:`, err?.message || err);
         }
 
         // Legacy fallback: send RADIUS Disconnect-Request (requires nasIp + shared secret)
         if (!nasIp || !secret) {
-            console.error(`❌ Cannot disconnect ${username}: missing nasIp/secret and MikroTik API failed/unavailable`);
-            return;
+            const hint = apiResult
+                ? "MikroTik API found no active entry"
+                : "MikroTik API failed/unavailable";
+            const error = `Cannot disconnect ${username}: missing nasIp/secret and ${hint}`;
+            console.error(`❌ ${error}`);
+            return { ok: false, method: "none", error };
         }
-        const coaPort = typeof port === "number" ? port : 3799; // MikroTik default for CoA/DM
+
+        const coaPort = typeof port === "number" && Number.isFinite(port) ? port : 3799; // MikroTik default for CoA/DM
+
+        // First try radclient if available (fast + proven).
+        const execAsync = util.promisify(exec);
         const command = `echo "User-Name = ${username}" | radclient -x ${nasIp}:${coaPort} disconnect ${secret}`;
 
-        exec(command, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`❌ Error disconnecting user ${username} via radclient:`, error.message);
-                return;
+        try {
+            // radclient can also hang depending on network; hard-timeout it.
+            const { stdout, stderr } = await execAsync(command, { timeout: 5000 });
+            if (stderr && stderr.trim().length) {
+                console.warn(`⚠️ radclient stderr for ${username}:`, stderr);
             }
-            if (stderr) {
-                console.error(`⚠️ Warning: ${stderr}`);
+            console.log(`✅ User ${username} disconnected via radclient`, { nasIp, coaPort });
+            return { ok: true, method: "radclient", stdout: stdout ?? "", stderr: stderr ?? "" };
+        } catch (err: any) {
+            const error = err?.message || String(err);
+            const stderr = String(err?.stderr ?? "");
+
+            // If radclient binary is missing in the runtime image, fall back to a native UDP Disconnect-Request.
+            const looksLikeMissingRadclient =
+                /radclient:\s*not found/i.test(error) ||
+                /radclient:\s*not found/i.test(stderr) ||
+                /ENOENT/i.test(error);
+
+            if (!looksLikeMissingRadclient) {
+                console.error(`❌ Error disconnecting user ${username} via radclient:`, error);
+                return {
+                    ok: false,
+                    method: "radclient",
+                    error,
+                    stdout: err?.stdout,
+                    stderr: err?.stderr,
+                };
             }
-            console.log(`✅ User ${username} disconnected via radclient:`, stdout);
+
+            try {
+                // node-radius supports Disconnect-Request (RFC 5176).
+                // We send to NAS CoA/DM port and wait briefly for ACK/NAK.
+                const packet = radius.encode({
+                    code: "Disconnect-Request",
+                    secret,
+                    identifier: Math.floor(Math.random() * 256),
+                    attributes: [
+                        ["User-Name", username],
+                    ],
+                });
+
+                const sock = dgram.createSocket("udp4");
+                const response = await new Promise<{ ok: boolean; msg: string }>((resolve) => {
+                    const t = setTimeout(() => {
+                        try { sock.close(); } catch { /* ignore */ }
+                        resolve({ ok: true, msg: "Disconnect-Request sent (no response within timeout)" });
+                    }, 1500);
+
+                    sock.on("message", (buf) => {
+                        clearTimeout(t);
+                        try {
+                            const decoded = radius.decode({ packet: buf, secret });
+                            const code = decoded?.code || "Unknown";
+                            try { sock.close(); } catch { /* ignore */ }
+                            resolve({ ok: true, msg: `Received ${code}` });
+                        } catch {
+                            try { sock.close(); } catch { /* ignore */ }
+                            resolve({ ok: true, msg: "Received response (decode failed)" });
+                        }
+                    });
+
+                    sock.send(packet, coaPort, nasIp, (e) => {
+                        if (e) {
+                            clearTimeout(t);
+                            try { sock.close(); } catch { /* ignore */ }
+                            resolve({ ok: false, msg: e.message });
+                        }
+                    });
+                });
+
+                if (!response.ok) {
+                    return { ok: false, method: "none", error: `Disconnect UDP send failed: ${response.msg}` };
+                }
+                console.log(`✅ User ${username} disconnect via UDP`, { nasIp, coaPort, msg: response.msg });
+                return { ok: true, method: "radclient", stdout: response.msg, stderr: "" };
+            } catch (e: any) {
+                return { ok: false, method: "none", error: `Disconnect fallback failed: ${e?.message || String(e)}` };
+            }
+        }
+    },
+
+    // Apply current profile speed to an active session via MikroTik CoA (no disconnect).
+    // This is the "Option A" fix for users stuck with a previous fallback dynamic queue rate.
+    applyProfileRateLimit: async (
+        username: string
+    ): Promise<
+        | { ok: true; method: "coa"; rateLimit: string; nasIp: string; acctSessionId: string; framedIp: string | null; stdout: string; stderr: string }
+        | { ok: false; method: "none" | "radclient"; error: string; stdout?: string; stderr?: string }
+    > => {
+        // 1) Find an active (non-stale) RADIUS session for the user
+        const sess = await getActiveRadiusSession(username);
+        if (!sess) {
+            return { ok: false, method: "none", error: `No active RADIUS session found for ${username}` };
+        }
+
+        // 2) Load user's current profile speeds
+        const user = await AppDataSource.getRepository(Raduserprofile).findOne({
+            where: { username },
+            relations: { profile: true },
         });
+        if (!user?.profile) {
+            return { ok: false, method: "none", error: `User/profile not found for ${username}` };
+        }
+        const rateLimit = formatMikrotikRateLimitKbps(user.profile.speedDown, user.profile.speedUp);
+
+        // 3) Resolve NAS shared secret
+        const nas = await AppDataSource.getRepository(Nas).findOne({ where: { nasname: sess.nasIp } });
+        if (!nas?.secret) {
+            return { ok: false, method: "none", error: `NAS secret not found for NAS ${sess.nasIp}` };
+        }
+
+        // 4) Send CoA
+        const execAsync = util.promisify(exec);
+        const coaPort = 3799; // MikroTik default for CoA/DM
+
+        // Quote Mikrotik-Rate-Limit value to avoid parsing issues.
+        const payloadLines = [
+            `User-Name = ${username}`,
+            `Acct-Session-Id = ${sess.acctSessionId}`,
+            `Mikrotik-Rate-Limit := \"${rateLimit}\"`,
+        ];
+        if (sess.framedIp) payloadLines.push(`Framed-IP-Address = ${sess.framedIp}`);
+        const payload = payloadLines.join("\n");
+
+        const command = `echo "${payload}" | radclient -x ${sess.nasIp}:${coaPort} coa ${nas.secret}`;
+
+        try {
+            const { stdout, stderr } = await execAsync(command, { timeout: 5000 });
+            return {
+                ok: true,
+                method: "coa",
+                rateLimit,
+                nasIp: sess.nasIp,
+                acctSessionId: sess.acctSessionId,
+                framedIp: sess.framedIp,
+                stdout: stdout ?? "",
+                stderr: stderr ?? "",
+            };
+        } catch (err: any) {
+            const error = err?.message || String(err);
+            return {
+                ok: false,
+                method: "radclient",
+                error,
+                stdout: err?.stdout,
+                stderr: err?.stderr,
+            };
+        }
+    },
+
+    // HTTP handler: apply current profile rate-limit via CoA
+    applyProfileRateLimitNow: async (req: Request, res: Response) => {
+        const username = String(req.params.username || "").trim();
+        if (!username) return sendResponse(res, false, 400, "Username is required");
+
+        try {
+            const result = await UserController.applyProfileRateLimit(username);
+            if (!result.ok) return sendResponse(res, false, 400, "Failed to apply rate-limit", result);
+            return sendResponse(res, true, 200, "Rate-limit applied", result);
+        } catch (e: any) {
+            console.error("applyProfileRateLimitNow failed:", e);
+            return sendResponse(res, false, 500, "Error applying rate-limit", { error: e?.message || String(e) });
+        }
     },
     searchUsers: async (req: Request, res: Response) => {
         try {
@@ -828,6 +1261,49 @@ export const UserController = {
                 await up.execute();
             }
 
+            // After profile assignment, if some users were previously FUP (fallback),
+            // and the new profile quotas now cover their current usage, clear fallback flags
+            // and apply the new profile speed via CoA (best-effort).
+            let restored = 0;
+            let coaApplied = 0;
+            let coaFailed = 0;
+            if (willUpdate.length > 0) {
+                try {
+                    const usageMap = await getQuotaUsageForUsers(willUpdate);
+                    const dailyQuota = parseBigIntSafe((profile as any).dailyQuota);
+                    const monthlyQuota = parseBigIntSafe((profile as any).monthlyQuota);
+
+                    const eligible = willUpdate.filter((u) => {
+                        const usage = usageMap[u] ?? { dailyUsage: BigInt(0), monthlyUsage: BigInt(0) };
+                        return !(usage.dailyUsage > dailyQuota || usage.monthlyUsage > monthlyQuota);
+                    });
+
+                    if (eligible.length > 0) {
+                        const clearQb = userRepo
+                            .createQueryBuilder()
+                            .update(Raduserprofile)
+                            .set({ isFallback: false, isMonthlyExceeded: false } as any)
+                            .where("username IN (:...usernames)", { usernames: eligible });
+                        if (isReseller) clearQb.andWhere("ownerResellerId = :rid", { rid: resellerId });
+                        await clearQb.execute();
+                        restored = eligible.length;
+
+                        // Apply CoA with limited concurrency so the request doesn't hang forever.
+                        const concurrency = 10;
+                        for (let i = 0; i < eligible.length; i += concurrency) {
+                            const chunk = eligible.slice(i, i + concurrency);
+                            const results = await Promise.allSettled(chunk.map((u) => UserController.applyProfileRateLimit(u)));
+                            for (const r of results) {
+                                if (r.status === "fulfilled" && (r.value as any)?.ok) coaApplied += 1;
+                                else coaFailed += 1;
+                            }
+                        }
+                    }
+                } catch (e: any) {
+                    console.warn("bulkAssignProfile post-processing failed:", e?.message || e);
+                }
+            }
+
             await deleteCacheKeys();
             await writeAuditLog({
                 req,
@@ -843,6 +1319,9 @@ export const UserController = {
                 updated: willUpdate.length,
                 skipped: matched.length - willUpdate.length,
                 notFound,
+                restoredFromFallback: restored,
+                coaApplied,
+                coaFailed,
             });
         } catch (e: any) {
             console.error("bulkAssignProfile failed:", e);

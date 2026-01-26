@@ -39,6 +39,20 @@ export class BandwidthService {
   private monitorInterface: string;
   private conn: any; // RouterOSAPI instance or null in mock mode
   private readonly mockMode: boolean;
+  private connecting: Promise<void> | null = null;
+  private lastConnectFailureAtMs: number | null = null;
+  private readonly connectCooldownMs: number;
+  private readonly connectTimeoutMs: number;
+  private readonly commandTimeoutMs: number;
+  private readonly cacheTtlMs: number;
+
+  private cache: {
+    interfaceTraffic: { value: BandwidthData[]; ts: number } | null;
+    systemResources: { value: any; ts: number } | null;
+  } = {
+    interfaceTraffic: null,
+    systemResources: null,
+  };
 
   constructor() {
     this.routerIP = process.env.MIKROTIK_IP || '172.9.16.2';
@@ -47,6 +61,14 @@ export class BandwidthService {
     this.password = process.env.MIKROTIK_PASSWORD || '123456';
     this.apiPort = parseInt(process.env.MIKROTIK_API_PORT || '8728');
     this.monitorInterface = process.env.MIKROTIK_MONITOR_INTERFACE || 'ether6-OUT';
+
+    // Fast defaults for a polling dashboard:
+    // - keep requests snappy even if router is slow/unreachable
+    // - cache results briefly to avoid hammering RouterOS every second
+    this.connectCooldownMs = parseInt(process.env.MIKROTIK_CONNECT_COOLDOWN_MS || '5000', 10);
+    this.connectTimeoutMs = parseInt(process.env.MIKROTIK_CONNECT_TIMEOUT_MS || '2000', 10);
+    this.commandTimeoutMs = parseInt(process.env.MIKROTIK_COMMAND_TIMEOUT_MS || '2500', 10);
+    this.cacheTtlMs = parseInt(process.env.MIKROTIK_CACHE_TTL_MS || '1500', 10);
 
     this.mockMode = !RouterOSAPI;
 
@@ -59,7 +81,7 @@ export class BandwidthService {
         user: this.username,
         password: this.password,
         port: this.apiPort,
-        timeout: 10000
+        timeout: this.commandTimeoutMs
       });
       logger.info('BandwidthService initialised in REAL MODE – MikroTik integration enabled');
 
@@ -98,14 +120,52 @@ export class BandwidthService {
     if (this.mockMode) return; // nothing to do
 
     try {
-      if (!this.conn.connected) {
-        logger.debug(`Connecting to MikroTik ${this.routerIP}:${this.apiPort}`);
-        await this.conn.connect();
-        logger.info('Connected to MikroTik');
+      if (this.conn.connected) return;
+
+      // If we recently failed to connect, fail fast to keep APIs responsive.
+      if (this.lastConnectFailureAtMs && Date.now() - this.lastConnectFailureAtMs < this.connectCooldownMs) {
+        throw new Error(`MikroTik connect cooldown (${this.connectCooldownMs}ms)`);
       }
+
+      // Deduplicate concurrent connect() calls (common when /metrics does Promise.all).
+      if (!this.connecting) {
+        this.connecting = (async () => {
+          logger.debug(`Connecting to MikroTik ${this.routerIP}:${this.apiPort}`);
+          await this.withTimeout(this.conn.connect(), this.connectTimeoutMs, 'mikrotik connect');
+          logger.info('Connected to MikroTik');
+          this.lastConnectFailureAtMs = null;
+        })().catch((err: any) => {
+          this.lastConnectFailureAtMs = Date.now();
+          // Ensure we are in a clean state for the next attempt.
+          try {
+            if (this.conn.connected) this.conn.close();
+          } catch {
+            // ignore
+          }
+          throw err;
+        }).finally(() => {
+          this.connecting = null;
+        });
+      }
+
+      await this.connecting;
     } catch (error: any) {
       logger.error('Failed to connect to MikroTik:', error.message || error);
       throw new Error('MikroTik connection failed');
+    }
+  }
+
+  private async withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    let t: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<T>((_resolve, reject) => {
+          t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        }),
+      ]);
+    } finally {
+      if (t) clearTimeout(t);
     }
   }
 
@@ -115,18 +175,34 @@ export class BandwidthService {
   async getInterfaceTraffic(): Promise<BandwidthData[]> {
     if (this.mockMode) return this.generateMockInterfaceTraffic();
 
+    const now = Date.now();
+    if (this.cache.interfaceTraffic && now - this.cache.interfaceTraffic.ts <= this.cacheTtlMs) {
+      return this.cache.interfaceTraffic.value;
+    }
+
     await this.ensureConnection();
 
     // We only care about one interface (default: ether6-OUT).
     // /interface/monitor-traffic returns *rates* (packets/sec, bits/sec), not cumulative bytes.
     const ifaceName = this.monitorInterface || 'ether6-OUT';
 
-    const stats = await this.conn.write('/interface/monitor-traffic', [
-      `=interface=${ifaceName}`,
-      '=once=yes',
-    ]).catch(() => []);
+    const stats = (await this.withTimeout(
+      this.conn.write('/interface/monitor-traffic', [
+        `=interface=${ifaceName}`,
+        '=once=yes',
+      ]),
+      this.commandTimeoutMs,
+      'interface monitor-traffic'
+    ).catch((e: any) => {
+      logger.warn('getInterfaceTraffic failed:', e?.message || e);
+      return [];
+    })) as any[];
 
-    if (!stats.length) return [];
+    if (!stats.length) {
+      // If router is flapping, serve stale cache if available.
+      if (this.cache.interfaceTraffic) return this.cache.interfaceTraffic.value;
+      return [];
+    }
     const s = stats[0];
 
     // Parse RouterOS rate strings like "17.7Mbps", "0bps", "11 117"
@@ -167,7 +243,7 @@ export class BandwidthService {
     const rxPacketsPerSec = Number.parseFloat(String(s['rx-packets-per-second'] ?? '0').replace(/\s+/g, '')) || 0;
     const txPacketsPerSec = Number.parseFloat(String(s['tx-packets-per-second'] ?? '0').replace(/\s+/g, '')) || 0;
 
-    return [
+    const result: BandwidthData[] = [
       {
         interface: ifaceName,
         // monitor-traffic doesn't provide cumulative bytes; keep 0 for now
@@ -182,6 +258,8 @@ export class BandwidthService {
         timestamp: new Date(),
       },
     ];
+    this.cache.interfaceTraffic = { value: result, ts: Date.now() };
+    return result;
   }
 
   /* ------------------------------------------------------------------
@@ -190,11 +268,23 @@ export class BandwidthService {
   async getSystemResources(): Promise<any> {
     if (this.mockMode) return this.generateMockSystemResources();
 
+    const now = Date.now();
+    if (this.cache.systemResources && now - this.cache.systemResources.ts <= this.cacheTtlMs) {
+      return this.cache.systemResources.value;
+    }
+
     await this.ensureConnection();
-    const res = await this.conn.write('/system/resource/print');
+    const res = (await this.withTimeout(
+      this.conn.write('/system/resource/print'),
+      this.commandTimeoutMs,
+      'system resource'
+    ).catch((e: any) => {
+      logger.warn('getSystemResources failed:', e?.message || e);
+      return [];
+    })) as any[];
     if (!res.length) throw new Error('No system resource data');
     const r = res[0];
-    return {
+    const out = {
       cpuLoad: r['cpu-load'] || '0%',
       freeMemory: r['free-memory'] || '0',
       totalMemory: r['total-memory'] || '0',
@@ -207,6 +297,8 @@ export class BandwidthService {
       architecture: r['architecture-name'] || 'Unknown',
       timestamp: new Date()
     };
+    this.cache.systemResources = { value: out, ts: Date.now() };
+    return out;
   }
 
   /* ------------------------------------------------------------------
@@ -304,9 +396,9 @@ export class BandwidthService {
       txByte: Math.floor(Math.random() * 2_000_000) + 300_000,
       rxPacket: Math.floor(Math.random() * 4_000) + 800,
       txPacket: Math.floor(Math.random() * 2_500) + 400,
-      // bits/sec
-      rxRate: (Math.random() * 200 + 10) * 1_000_000, // 10–210 Mbps
-      txRate: (Math.random() * 800 + 50) * 1_000_000, // 50–850 Mbps
+      // Mbps (match real mode output)
+      rxRate: (Math.random() * 200 + 10), // 10–210 Mbps
+      txRate: (Math.random() * 800 + 50), // 50–850 Mbps
       timestamp: new Date()
     }];
   }

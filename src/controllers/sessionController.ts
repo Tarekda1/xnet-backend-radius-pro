@@ -10,6 +10,8 @@ import { getOnlineUsers } from "../repo/onlineUsers";
 import eventBus from "../bus/eventBusSingleton";
 import { ConnectionLogs } from "../db/entities/ConnectionLogs";
 import { Radacct } from "../db/entities/Radacct";
+import { Nas } from "../db/entities/Nas";
+import { UserController } from "./userController";
 
 export const healthCheck = (req: Request, res: Response) => {
   res.status(200).json({ status: 'UP' });
@@ -169,7 +171,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
     if (limit < 1) limit = 10;
     const offset = (page - 1) * limit;
 
-    const sessionRepo = AppDataSource.getRepository(SessionTracking);
+    const radacctRepo = AppDataSource.getRepository(Radacct);
 
     // A session can be left "active" in DB if the NAS never sends Stop (power loss, crash, etc).
     // Treat sessions as "online" only if we saw a recent update.
@@ -178,31 +180,19 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
     const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
     const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
 
-    // 🔹 Count total sessions for pagination (this endpoint returns session rows)
-    const totalQb = sessionRepo
-      .createQueryBuilder("session")
-      .leftJoin(Raduserprofile, "userProfile", "session.username = userProfile.username")
-      // Join user_details ONLY for filtering; do not select/map it (avoids ONLY_FULL_GROUP_BY issues)
-      .leftJoin(UserDetails, "userDetails", "session.username = userDetails.username")
-      .select("COUNT(*)", "cnt")
-      .where("session.status = :status", { status: "active" })
-      // Source of truth for "actually online": there must be a currently-open radacct row
-      // for the same Acct-Session-Id, with a recent update.
-      .andWhere(
-        `EXISTS (
-           SELECT 1
-           FROM radacct ra
-           WHERE ra.acctsessionid = session.session_id
-             AND ra.acctstoptime IS NULL
-             AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
-         )`,
-        { staleCutoff }
-      );
+    // 🔹 Count total online users (source of truth: open + fresh radacct)
+    const totalQb = radacctRepo
+      .createQueryBuilder("ra")
+      .leftJoin(Raduserprofile, "userProfile", "ra.username = userProfile.username")
+      .leftJoin(UserDetails, "userDetails", "ra.username = userDetails.username")
+      .select("COUNT(DISTINCT ra.username)", "cnt")
+      .where("ra.acctstoptime IS NULL")
+      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff });
 
     if (search) {
       totalQb.andWhere(
         new Brackets((qb) => {
-          qb.where("LOWER(session.username) LIKE :search", { search: `%${search}%` }).orWhere(
+          qb.where("LOWER(ra.username) LIKE :search", { search: `%${search}%` }).orWhere(
             "LOWER(userDetails.full_name) LIKE :search",
             { search: `%${search}%` }
           );
@@ -218,18 +208,16 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
 
     const totalUsers = Number(totalUsersRow?.cnt ?? 0);
 
-    // 🔹 Query online users with daily & monthly usage
-    const users = await sessionRepo
-      .createQueryBuilder("session")
-      .leftJoinAndSelect(Radusagestats, "usage", "session.username = usage.username AND usage.day = :today", { today })
-      // Live counters from radacct (Acct-Input/Output-Octets) – these update via interim-updates from NAS.
-      // session_tracking bytes_* are not always updated depending on your ingestion pipeline, so prefer radacct.
-      .leftJoin(
-        "radacct",
-        "raLive",
-        "raLive.acctsessionid = session.session_id AND raLive.acctstoptime IS NULL AND COALESCE(raLive.acctupdatetime, raLive.acctstarttime) >= :staleCutoff",
-        { staleCutoff }
-      )
+    // A smaller window for "active" vs "idle" display. Still included as long as within staleCutoff.
+    const activeSecondsRaw = parseInt(process.env.ONLINE_SESSION_ACTIVE_SECONDS || "120", 10);
+    const activeSeconds = Number.isFinite(activeSecondsRaw) && activeSecondsRaw > 0 ? activeSecondsRaw : 120;
+    const activeCutoff = new Date(Date.now() - activeSeconds * 1000);
+
+    // 🔹 Query online users with daily & monthly usage (base: radacct)
+    const users = await radacctRepo
+      .createQueryBuilder("ra")
+      .leftJoin(SessionTracking, "st", "st.session_id = ra.acctsessionid AND st.username = ra.username")
+      .leftJoinAndSelect(Radusagestats, "usage", "ra.username = usage.username AND usage.day = :today", { today })
       .leftJoin(
         (qb) =>
           qb
@@ -245,7 +233,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
             .andWhere("du.endTime IS NULL")
             .groupBy("du.username"),
         "dailyUsage",
-        "session.username = dailyUsage.du_username"
+        "ra.username = dailyUsage.du_username"
       )
       .leftJoin(qb =>
         qb.from(Radusagestats, "monthlyUsage")
@@ -256,65 +244,57 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
           .where("monthlyUsage.day BETWEEN :firstDayOfMonth AND :today", { firstDayOfMonth: firstDayOfMonthStr, today })
           .groupBy("monthlyUsage.username"),
         "monthlyUsage",
-        "session.username = monthlyUsage.monthly_username"
+        "ra.username = monthlyUsage.monthly_username"
       )
-      .leftJoin(Raduserprofile, "userProfile", "session.username = userProfile.username")
+      .leftJoin(Raduserprofile, "userProfile", "ra.username = userProfile.username")
       .leftJoin(Radprofile, "profile", "userProfile.profileId = profile.id")
       .leftJoinAndMapOne(
         "user.userDetails",
         UserDetails,
         "userDetails",
-        "session.username = userDetails.username"
+        "ra.username = userDetails.username"
       )
       .select([
-        "session.username",
-        "session.macAddress",
-        "session.status",
-        "session.startTime",
-        "session.lastUpdate",
-        "session.sessionTime",
+        "ra.username AS session_username",
+        "COALESCE(st.mac_address, ra.callingstationid, '') AS session_mac_address",
+        "ra.acctstarttime AS session_start_time",
+        "COALESCE(ra.acctupdatetime, ra.acctstarttime) AS session_last_update",
+        "ra.acctsessiontime AS session_session_time",
+        "CASE WHEN COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :activeCutoff THEN 'active' ELSE 'idle' END AS session_status",
         // Live counters from radacct (used by frontend to calculate real-time traffic rate)
-        "COALESCE(raLive.acctinputoctets, 0) AS total_bytes_in",
-        "COALESCE(raLive.acctoutputoctets, 0) AS total_bytes_out",
+        "COALESCE(ra.acctinputoctets, 0) AS total_bytes_in",
+        "COALESCE(ra.acctoutputoctets, 0) AS total_bytes_out",
         "COALESCE(dailyUsage.daily_usage, 0) AS total_daily_usage",
         "COALESCE(usage.data_usage, 0) AS real_time_data_usage",
         "COALESCE(monthlyUsage.monthly_usage, 0) AS monthly_usage",
-        "profile.profileName",
-        "profile.dailyQuota",
-        "userProfile.is_fallback",
-        "profile.monthlyQuota",
+        "profile.profileName AS profile_profile_name",
+        "profile.dailyQuota AS profile_daily_quota",
+        "profile.monthlyQuota AS profile_monthly_quota",
+        "COALESCE(userProfile.is_fallback, 0) AS is_fallback",
         "GREATEST(profile.dailyQuota - COALESCE(usage.data_usage, 0), 0) AS remaining_daily_quota",
         "GREATEST(profile.monthlyQuota - COALESCE(monthlyUsage.monthly_usage, 0), 0) AS remaining_monthly_quota",
-        "userDetails.fullName",
+        "userDetails.fullName AS userDetails_full_name",
       ])
-      .where("session.status = :status", { status: "active" })
-      .andWhere(
-        `EXISTS (
-           SELECT 1
-           FROM radacct ra
-           WHERE ra.acctsessionid = session.session_id
-             AND ra.acctstoptime IS NULL
-             AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
-         )`,
-        { staleCutoff }
-      )
+      .where("ra.acctstoptime IS NULL")
+      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
       .andWhere(new Brackets(qb => {
-        qb.where("LOWER(session.username) LIKE :search", { search: `%${search}%` })
+        qb.where("LOWER(ra.username) LIKE :search", { search: `%${search}%` })
           .orWhere("LOWER(userDetails.fullName) LIKE :search", { search: `%${search}%` });
       }))
       .andWhere(new Brackets((qb) => {
         if (!isReseller) return;
         qb.where("userProfile.owner_reseller_id = :rid", { rid: resellerId });
       }))
-      .groupBy(`session.username, session.macAddress, session.status, 
-        session.startTime, session.lastUpdate,
-        session.sessionTime, raLive.acctinputoctets, raLive.acctoutputoctets,
+      .groupBy(`ra.username, ra.acctsessionid, ra.callingstationid, ra.acctstarttime, ra.acctupdatetime, ra.acctsessiontime,
+        st.mac_address,
+        ra.acctinputoctets, ra.acctoutputoctets,
         usage.data_usage, monthlyUsage.monthly_usage, dailyUsage.daily_usage,
-        profile.profileName, profile.dailyQuota, profile.monthlyQuota,userProfile.is_fallback`)
-      .orderBy("session.startTime", "DESC") // Optional sorting
+        profile.profileName, profile.dailyQuota, profile.monthlyQuota, userProfile.is_fallback,
+        userDetails.fullName`)
+      .orderBy("COALESCE(ra.acctupdatetime, ra.acctstarttime)", "DESC")
       .limit(limit)
       .offset(offset)
-      .setParameters({ todayStart, tomorrowStart })
+      .setParameters({ todayStart, tomorrowStart, activeCutoff })
       .getRawMany();
 
     res.status(200).json({
@@ -352,27 +332,15 @@ export const getOnlineUsersMetrics = async (req: Request, res: Response) => {
     return;
   }
 
-  // Reseller-scoped metrics: count only sessions for reseller-owned users
-  const sessionRepo = AppDataSource.getRepository(SessionTracking);
-  const row = await sessionRepo
-    .createQueryBuilder("s")
-    .leftJoin(Raduserprofile, "u", "s.username = u.username")
-    .select([
-      "COUNT(DISTINCT s.username) AS totalOnlineUsers",
-      "COUNT(DISTINCT CASE WHEN s.status = 'active' THEN s.username END) AS totalActiveUsers",
-    ])
-    .where("s.status = 'active'")
-    .andWhere(
-      `EXISTS (
-         SELECT 1
-         FROM radacct ra
-         WHERE ra.acctsessionid = s.session_id
-           AND ra.acctstoptime IS NULL
-           AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
-       )`,
-      { staleCutoff }
-    )
-    .andWhere("u.owner_reseller_id = :rid", { rid: resellerId })
+  // Reseller-scoped metrics: count only reseller-owned users with open+fresh radacct
+  const raRepo = AppDataSource.getRepository(Radacct);
+  const row = await raRepo
+    .createQueryBuilder("ra")
+    .innerJoin(Raduserprofile, "u", "u.username = ra.username AND u.owner_reseller_id = :rid", { rid: resellerId })
+    .select("COUNT(DISTINCT ra.username)", "totalOnlineUsers")
+    .addSelect("COUNT(DISTINCT ra.username)", "totalActiveUsers")
+    .where("ra.acctstoptime IS NULL")
+    .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
     .getRawOne<{ totalOnlineUsers: string; totalActiveUsers: string }>();
 
   res.status(200).json({
@@ -473,9 +441,10 @@ export const getUserSessions = async (req: Request, res: Response) => {
 export const disconnectOnlineUser = async (req: Request, res: Response) => {
   try {
     const username = String(req.body?.username ?? "").trim();
-    const ip = req.body?.ip;
-    const code = req.body?.code;
-    const port = req.body?.port;
+    const ip = typeof req.body?.ip === "string" ? req.body.ip.trim() : undefined;
+    const code = typeof req.body?.code === "string" ? req.body.code : undefined;
+    const portRaw = req.body?.port;
+    const port = typeof portRaw === "number" ? portRaw : Number(portRaw);
 
     if (!username) {
       res.status(400).json({ success: false, message: "username is required" });
@@ -497,23 +466,72 @@ export const disconnectOnlineUser = async (req: Request, res: Response) => {
       }
     }
 
-    await eventBus.publish({
-      action: "disconnectAndCompleteSession",
-      username,
-      reason: "manualDisconnect",
-      // Backwards-compat: if caller passes NAS ip/secret, the consumer can fall back to radclient
-      ...(ip && code
-        ? {
-            ip,
-            code,
-            port: typeof port === "number" ? port : undefined,
-          }
-        : {}),
-    });
+    // Prefer direct disconnect so UI action does not depend on RabbitMQ/consumer being connected.
+    // We still allow optional ip/code/port from older clients, but we can also look these up safely server-side.
+    let nasIpToUse = ip;
+    let secretToUse = code;
 
-    res.status(202).json({ success: true, message: "Disconnect scheduled" });
+    if (!nasIpToUse || !secretToUse) {
+      const raRepo = AppDataSource.getRepository(Radacct);
+      const active = await raRepo
+        .createQueryBuilder("ra")
+        .select(["ra.nasipaddress AS nasipaddress"])
+        .where("ra.username = :username", { username })
+        .andWhere("ra.acctstoptime IS NULL")
+        .orderBy("ra.acctstarttime", "DESC")
+        .limit(1)
+        .getRawOne<{ nasipaddress?: string }>();
+
+      if (!nasIpToUse) nasIpToUse = String(active?.nasipaddress ?? "").trim() || undefined;
+      if (nasIpToUse && !secretToUse) {
+        const nasRepo = AppDataSource.getRepository(Nas);
+        const nas = await nasRepo.findOne({ where: { nasname: nasIpToUse } as any });
+        secretToUse = nas?.secret;
+      }
+    }
+
+    const disconnectPromise = UserController.disconnectUser(
+      username,
+      nasIpToUse,
+      secretToUse,
+      Number.isFinite(port) ? port : undefined
+    );
+
+    // Do not let the HTTP request hang forever; return quickly.
+    const waitMsRaw = parseInt(process.env.DISCONNECT_HTTP_WAIT_MS || "3000", 10);
+    const waitMs = Number.isFinite(waitMsRaw) && waitMsRaw > 0 ? waitMsRaw : 3000;
+
+    let responded = false;
+    const timer = setTimeout(() => {
+      if (responded) return;
+      responded = true;
+      res.status(202).json({ success: true, message: "Disconnect started" });
+    }, waitMs);
+
+    try {
+      const result = await disconnectPromise;
+      if (responded) return; // already returned 202
+      responded = true;
+      clearTimeout(timer);
+
+      if (!result.ok) {
+        res.status(500).json({ success: false, message: result.error });
+        return;
+      }
+      res.status(200).json({ success: true, message: "Disconnect sent", data: result });
+    } finally {
+      clearTimeout(timer);
+      // If we already responded 202, still log the eventual outcome for debugging.
+      if (responded) {
+        disconnectPromise
+          .then((r) => {
+            if (!r.ok) console.error(`❌ Disconnect finished with error for ${username}:`, r.error);
+          })
+          .catch((e) => console.error(`❌ Disconnect promise rejected for ${username}:`, e));
+      }
+    }
   } catch (error) {
-    console.error("Error scheduling disconnect:", error);
+    console.error("Error disconnecting user:", error);
     res.status(500).json({ success: false, message: "Server Error" });
   }
 };

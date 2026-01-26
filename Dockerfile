@@ -5,7 +5,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 # MySQL client tools (provides `mysqldump` on Alpine)
-RUN apk add --no-cache mysql-client
+RUN apk add --no-cache mysql-client freeradius-client
 
 # Copy package.json and lock file
 COPY package*.json ./

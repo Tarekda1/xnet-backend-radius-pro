@@ -163,12 +163,14 @@ services:
       # Linux host: default /var/run/docker.sock
       # Windows Docker Desktop: set DOCKER_SOCK=//./pipe/docker_engine in .env
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       # FreeRADIUS file logs (detail / auth-detail / radacct) exported by radius-docker-image
       - ../radius-docker-image/logs:/var/log/freeradius:ro
     depends_on:
       - loki
     networks:
       - backend_network
+      
 
   clickhouse:
     image: clickhouse/clickhouse-server:25.1

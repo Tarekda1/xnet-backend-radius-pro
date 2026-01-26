@@ -1,6 +1,6 @@
 import { AppDataSource } from "../db/config";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
-import { SessionTracking } from "../db/entities/SessionTracking";
+import { Radacct } from "../db/entities/Radacct";
 
 export const getOnlineUsers = async () => {
 
@@ -9,25 +9,16 @@ export const getOnlineUsers = async () => {
     const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
     const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
 
-    const sessionRepo = AppDataSource.getRepository(SessionTracking);
+    const radacctRepo = AppDataSource.getRepository(Radacct);
     const radUserProfileRepo = AppDataSource.getRepository(Raduserprofile);
 
-     // 🔹 Count total users for pagination
-     const totalOnlineUsers = await sessionRepo
-     .createQueryBuilder("session")
-     .where("session.status = :status", { status: "active" })
-     // Use radacct as source of truth: must have an open accounting session with a recent update.
-     .andWhere(
-        `EXISTS (
-           SELECT 1
-           FROM radacct ra
-           WHERE ra.acctsessionid = session.session_id
-             AND ra.acctstoptime IS NULL
-             AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
-         )`,
-        { staleCutoff }
-     )
-     .getCount();
+     // Source of truth: open + fresh accounting sessions
+     const totalOnlineUsers = await radacctRepo
+     .createQueryBuilder("ra")
+     .select("COUNT(DISTINCT ra.username)", "cnt")
+     .where("ra.acctstoptime IS NULL")
+     .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
+     .getRawOne<{ cnt: string }>();
 
      const totalActiveUsers = await radUserProfileRepo
      .createQueryBuilder("userprofile")
@@ -36,7 +27,7 @@ export const getOnlineUsers = async () => {
 
 
      return {
-        totalOnlineUsers: totalOnlineUsers, // 🔹 Total users for pag
+        totalOnlineUsers: Number(totalOnlineUsers?.cnt ?? 0),
         totalActiveUsers: totalActiveUsers,
      }
 }

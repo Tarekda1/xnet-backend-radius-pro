@@ -16,8 +16,10 @@ router.get('/users', authorizeAnyPermissions('users.view', 'reseller.users.view'
 // Note: admins don't currently have a separate `users.manage` permission, so `users.view` implies manage for admins.
 // Resellers must have `reseller.users.manage` for destructive actions.
 router.put('/users/resetQuota/:username', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.resetDailyQuota);
+router.put('/users/resetMonthlyQuota/:username', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.resetMonthlyQuota);
 router.put('/users/:username', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.updateUser);
 router.post('/users/resetAddress/:username', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.resetMacAddress);
+router.post('/users/:username/apply-rate-limit', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.applyProfileRateLimitNow);
 router.post('/users/bulk/assign-profile', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.bulkAssignProfile);
 router.post('/users/bulk/set-status', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.bulkSetStatus);
 router.post('/users/bulk/reset-mac', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.bulkResetMac);

@@ -63,4 +63,69 @@ export class QuotaService {
       await queryRunner.release();
     }
   }
+
+  async resetMonthlyQuota(username: string): Promise<void> {
+    const queryRunner: QueryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // Reset current "monthly window" usage as used by the backend/monthly calc:
+      // day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
+      await queryRunner.query(
+        `
+        UPDATE radusagestats s
+        INNER JOIN raduserprofile up
+          ON up.username = s.username
+        SET s.data_usage = 0
+        WHERE s.username = ?
+          AND s.day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d');
+        `,
+        [username]
+      );
+
+      // Best-effort reset of session tracking counters for this user's current window.
+      // (SessionTracking is an app table; accounting data is still kept in radacct.)
+      await queryRunner.query(
+        `
+        UPDATE session_tracking st
+        INNER JOIN raduserprofile up
+          ON up.username = st.username
+        SET st.daily_bytes_in = 0,
+            st.daily_bytes_out = 0,
+            st.daily_session_time = 0,
+            st.bytes_in = 0,
+            st.bytes_out = 0,
+            st.session_time = 0,
+            st.last_update = NOW()
+        WHERE st.username = ?
+          AND DATE(st.start_time) >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
+          AND (DATE(st.end_time) >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d') OR st.end_time IS NULL);
+        `,
+        [username]
+      );
+
+      // Clear monthly exceeded + fallback flags for the user.
+      const userProfileRepository = queryRunner.manager.getRepository(Raduserprofile);
+      await userProfileRepository.update({ username }, { isMonthlyExceeded: false, isFallback: false });
+
+      await queryRunner.commitTransaction();
+
+      // Invalidate cache
+      await this.cacheService.deleteCacheKeys();
+
+      // Disconnect so the user re-auths and normal profile applies immediately.
+      await this.eventBus.publish({
+        action: 'disconnectAndCompleteSession',
+        username,
+        reason: 'monthlyQuotaReset'
+      });
+    } catch (error) {
+      console.error('Error resetting monthly quota:', error);
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
 }
