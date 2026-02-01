@@ -29,6 +29,54 @@ const sendResponse = (res: Response, success: boolean, status: number, message: 
     res.status(status).json({ success, message, data });
 };
 
+async function upsertUserDefaultProfileBestEffort(username: string, profileId: number): Promise<void> {
+    try {
+        if (!username || !Number.isFinite(profileId) || profileId <= 0) return;
+        await AppDataSource.query(
+            `
+            INSERT INTO user_default_profiles (username, default_profile_id)
+            VALUES (?, ?)
+            ON DUPLICATE KEY UPDATE default_profile_id = VALUES(default_profile_id);
+            `,
+            [username, profileId]
+        );
+    } catch (e: any) {
+        // Don't fail user creation/update if table isn't present yet.
+        console.warn("upsertUserDefaultProfile: skipped:", e?.message || e);
+    }
+}
+
+async function upsertUserDefaultProfilesBulkBestEffort(usernames: string[], profileId: number): Promise<void> {
+    try {
+        if (!Array.isArray(usernames) || usernames.length === 0) return;
+        if (!Number.isFinite(profileId) || profileId <= 0) return;
+
+        // Keep query size reasonable
+        const chunkSize = 200;
+        for (let i = 0; i < usernames.length; i += chunkSize) {
+            const chunk = usernames.slice(i, i + chunkSize).filter(Boolean);
+            if (chunk.length === 0) continue;
+
+            const values = chunk.map(() => "(?, ?)").join(", ");
+            const params: any[] = [];
+            for (const u of chunk) {
+                params.push(u, profileId);
+            }
+
+            await AppDataSource.query(
+                `
+                INSERT INTO user_default_profiles (username, default_profile_id)
+                VALUES ${values}
+                ON DUPLICATE KEY UPDATE default_profile_id = VALUES(default_profile_id);
+                `,
+                params
+            );
+        }
+    } catch (e: any) {
+        console.warn("upsertUserDefaultProfilesBulk: skipped:", e?.message || e);
+    }
+}
+
 function normalizeUsernames(input: unknown): string[] {
     if (!Array.isArray(input)) return [];
     const cleaned = input
@@ -260,6 +308,31 @@ function parseBigIntSafe(v: any): bigint {
     }
 }
 
+function withQuotaExceededFlags(users: any[]): Promise<any[]> {
+    // Compute daily exceeded from today's usage vs profile.dailyQuota.
+    // Compute monthly exceeded from current-window usage vs profile.monthlyQuota (for UI/reporting).
+    const usernames = Array.isArray(users) ? users.map((u) => String(u?.username ?? "")).filter(Boolean) : [];
+    if (usernames.length === 0) return Promise.resolve(users);
+
+    return (async () => {
+        const usageMap = await getQuotaUsageForUsers(usernames);
+        return users.map((u) => {
+            const username = String(u?.username ?? "");
+            const usage = usageMap[username] ?? { dailyUsage: BigInt(0), monthlyUsage: BigInt(0) };
+            const dailyQuota = parseBigIntSafe(u?.profile?.dailyQuota);
+            const monthlyQuota = parseBigIntSafe(u?.profile?.monthlyQuota);
+            const isDailyExceeded = usage.dailyUsage > dailyQuota;
+            const isMonthlyExceededComputed = usage.monthlyUsage > monthlyQuota;
+            return {
+                ...u,
+                isDailyExceeded,
+                // keep existing stored flag as-is, but provide computed too for reporting consistency
+                isMonthlyExceededComputed,
+            };
+        });
+    })();
+}
+
 
 export const UserController = {
     quotaService: new QuotaService(AppDataSource, eventBus, new CacheService()),
@@ -294,13 +367,17 @@ export const UserController = {
 
                 const freshStatus = await getFreshUsersStatusMap(usernames, staleCutoff);
 
-                const mergedData = {
-                    ...userData,
-                    users: users.map((user: any) => ({
+                const enrichedUsers = await withQuotaExceededFlags(
+                    users.map((user: any) => ({
                         ...user,
                         isOnline: !!freshStatus[user.username]?.isOnline,
                         lastTimeActive: freshStatus[user.username]?.lastTimeActive ?? user.lastTimeActive ?? null,
-                    })),
+                    }))
+                );
+
+                const mergedData = {
+                    ...userData,
+                    users: enrichedUsers,
                 };
 
                 return sendResponse(res, true, 200, "Users fetched successfully", mergedData);
@@ -413,8 +490,9 @@ export const UserController = {
             const { entities, raw } = await qb.getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);
+            const usersWithQuota = await withQuotaExceededFlags(users);
 
-            if (users.length === 0) {
+            if (usersWithQuota.length === 0) {
                 return sendResponse(res, true, 200, "No users found", []);
             }
 
@@ -430,7 +508,7 @@ export const UserController = {
                 totalPages: Math.ceil(totalUsers / limit),
                 currentPage: page,
                 limit,
-                users
+                users: usersWithQuota
             };
 
             // Cache user data for 1 hour
@@ -528,6 +606,7 @@ export const UserController = {
                     (user as any).ownerResellerId = resellerId;
                 }
                 await userRepository.save(user);
+                await upsertUserDefaultProfileBestEffort(username, profileId);
 
                 // Create UserDetails entity
                 const userDetails = new UserDetails();
@@ -630,6 +709,9 @@ export const UserController = {
                 if (accountStatus) user.accountStatus = accountStatus;
 
                 await userRepository.save(user); // Save updates
+                if (typeof profileId === "number" && Number.isFinite(profileId) && profileId > 0 && profileId !== oldProfileId) {
+                    await upsertUserDefaultProfileBestEffort(username, profileId);
+                }
 
                 // 🔹 Update or create user details
                 let userDetails = await userDetailsRepository.findOne({ where: { username } });
@@ -1178,23 +1260,108 @@ export const UserController = {
                 .getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);
+            const usersWithQuota = await withQuotaExceededFlags(users);
 
-            if (users.length === 0) {
+            if (usersWithQuota.length === 0) {
                 return sendResponse(res, true, 200, "No users found", []);
             }
 
             const responseData = {
-                totalUsers: users.length,
+                totalUsers: usersWithQuota.length,
                 totalPages: 1,
                 currentPage: 1,
-                limit: users.length,
-                users
+                limit: usersWithQuota.length,
+                users: usersWithQuota
             };
 
             return sendResponse(res, true, 200, "Users fetched successfully", responseData);
         } catch (error) {
             console.error("Error searching users:", error);
             return sendResponse(res, false, 500, "Error searching users");
+        }
+    },
+
+    getQuotaExceededUsers: async (req: Request, res: Response) => {
+        try {
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const includeRows =
+                String((req.query as any)?.includeRows ?? "")
+                    .trim()
+                    .toLowerCase() === "true" ||
+                String((req.query as any)?.includeRows ?? "").trim() === "1";
+
+            const where = isReseller ? "WHERE up.owner_reseller_id = ?" : "";
+            const params = isReseller ? [resellerId] : [];
+
+            const totalRows = await AppDataSource.query(
+                `SELECT COUNT(*) AS total FROM raduserprofile up ${where};`,
+                params
+            );
+            const totalUsers = Number((totalRows as any[])?.[0]?.total ?? 0);
+
+            // Fetch only users whose daily OR monthly usage exceeds their profile quotas.
+            // We compute usage in SQL so we don't need to paginate across all users.
+            const rows = await AppDataSource.query(
+                `
+                SELECT
+                    up.username AS username,
+                    ud.full_name AS fullName,
+                    p.profile_name AS profileName,
+                    COALESCE(SUM(CASE WHEN s.day = CURDATE() THEN s.data_usage ELSE 0 END), 0) AS dailyUsage,
+                    COALESCE(SUM(CASE
+                        WHEN s.day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
+                        THEN s.data_usage ELSE 0 END), 0) AS monthlyUsage,
+                    p.daily_quota AS dailyQuota,
+                    p.monthly_quota AS monthlyQuota
+                FROM raduserprofile up
+                INNER JOIN radprofile p
+                    ON p.id = up.profile_id
+                LEFT JOIN radusagestats s
+                    ON s.username = up.username
+                LEFT JOIN user_details ud
+                    ON ud.username = up.username
+                ${where}
+                GROUP BY
+                    up.username,
+                    ud.full_name,
+                    p.profile_name,
+                    p.daily_quota,
+                    p.monthly_quota,
+                    up.quota_reset_day
+                HAVING dailyUsage > dailyQuota OR monthlyUsage > monthlyQuota
+                ORDER BY up.username ASC;
+                `,
+                params
+            );
+
+            const toRow = (r: any) => ({
+                username: String(r?.username ?? ""),
+                fullName: r?.fullName ?? null,
+                profileName: r?.profileName ?? null,
+            });
+
+            const monthlyAccounts = (rows as any[])
+                .filter((r) => parseBigIntSafe(r?.monthlyUsage) > parseBigIntSafe(r?.monthlyQuota))
+                .map(toRow)
+                .filter((r) => r.username);
+
+            const dailyAccounts = (rows as any[])
+                .filter((r) => parseBigIntSafe(r?.dailyUsage) > parseBigIntSafe(r?.dailyQuota))
+                .map(toRow)
+                .filter((r) => r.username);
+
+            const monthlyCount = monthlyAccounts.length;
+            const dailyCount = dailyAccounts.length;
+
+            return sendResponse(res, true, 200, "Quota exceeded users fetched successfully", {
+                totalUsers,
+                monthlyCount,
+                dailyCount,
+                ...(includeRows ? { monthlyAccounts, dailyAccounts } : {}),
+            });
+        } catch (error) {
+            console.error("Error fetching quota exceeded users:", error);
+            return sendResponse(res, false, 500, "Error fetching quota exceeded users");
         }
     },
 
@@ -1259,6 +1426,9 @@ export const UserController = {
                 up.where("username IN (:...usernames)", { usernames: willUpdate });
                 if (isReseller) up.andWhere("ownerResellerId = :rid", { rid: resellerId });
                 await up.execute();
+
+                // Keep "default/original plan" mapping in sync with admin profile changes.
+                await upsertUserDefaultProfilesBulkBestEffort(willUpdate, profileId);
             }
 
             // After profile assignment, if some users were previously FUP (fallback),
@@ -1751,6 +1921,18 @@ export const UserController = {
                             (user as any).ownerResellerId = resellerId;
                         }
                         await manager.save(Raduserprofile, user);
+                        try {
+                            await manager.query(
+                                `
+                                INSERT INTO user_default_profiles (username, default_profile_id)
+                                VALUES (?, ?)
+                                ON DUPLICATE KEY UPDATE default_profile_id = VALUES(default_profile_id);
+                                `,
+                                [u.username, u.profileId]
+                            );
+                        } catch (e: any) {
+                            console.warn("bulkCreateUsers: upsert user_default_profiles skipped:", e?.message || e);
+                        }
 
                         const userDetails = new UserDetails();
                         userDetails.username = u.username;

@@ -34,12 +34,18 @@ import { RolePermission } from './entities/RolePermission';
 import { UserPermissionOverride } from './entities/UserPermissionOverride';
 import { Reseller } from './entities/Reseller';
 import { ResellerLedgerEntry } from './entities/ResellerLedgerEntry';
+import { CableVisionAccount } from './entities/CableVisionAccount';
+import { CableVisionProfile } from './entities/CableVisionProfile';
+import { CableVisionInvoice } from './entities/CableVisionInvoice';
 
 // Create entities array with explicit references
 const entities = [
     BlockedMacs,
     ConnectionLogs,
     DetailedUsage,
+    CableVisionAccount,
+    CableVisionProfile,
+    CableVisionInvoice,
     ExternalInvoice,
     Invoices,
     Logs,

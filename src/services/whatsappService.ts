@@ -27,6 +27,201 @@ export async function sendWhatsAppMessage({ to, message, templateVariables }: Wh
     return sendViaCloud({ to, message });
 }
 
+function formatProviderConfigError(provider: string): string {
+    if (process.env.WHATSAPP_ENABLED !== 'true') {
+        return "WhatsApp is disabled (set WHATSAPP_ENABLED='true').";
+    }
+    if (provider === "twilio") {
+        return "Twilio WhatsApp not configured (need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_CONTENT_SID, and TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID).";
+    }
+    return "WhatsApp Cloud not configured (need WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID).";
+}
+
+function extractDigitsOrThrow(to: string): string {
+    const overrideDigits = resolveOverrideDigits();
+    const digits = (overrideDigits || to || "").replace(/\D/g, "");
+    if (!digits) throw new Error("Invalid recipient phone number (no digits after normalization).");
+    return digits;
+}
+
+function extractAxiosErrorMessage(error: any): string {
+    const status = error?.response?.status;
+    const data = error?.response?.data;
+    const base = error?.message || "Request failed";
+    try {
+        const payload = data ? JSON.stringify(data) : "";
+        return status ? `${base} (status ${status})${payload ? `: ${payload}` : ""}` : base;
+    } catch {
+        return status ? `${base} (status ${status})` : base;
+    }
+}
+
+/**
+ * Strict WhatsApp sender: throws if message is not actually sent.
+ * Use this for user-facing actions (e.g. "Send reminder") where silent no-ops are confusing.
+ */
+export async function sendWhatsAppMessageStrict(
+    opts: WhatsAppSendOptions
+): Promise<{ provider: string; to: string; mode: string; sid?: string; status?: string; errorCode?: any; errorMessage?: any }> {
+    const provider = (process.env.WHATSAPP_PROVIDER || 'cloud').toLowerCase();
+    if (process.env.WHATSAPP_ENABLED !== 'true') {
+        throw new Error(formatProviderConfigError(provider));
+    }
+
+    if (provider === "twilio") {
+        const accountSid = process.env.TWILIO_ACCOUNT_SID;
+        const authToken = process.env.TWILIO_AUTH_TOKEN;
+        const from = process.env.TWILIO_WHATSAPP_FROM;
+        const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
+        const contentSid = process.env.TWILIO_CONTENT_SID;
+
+        if (!accountSid || !authToken || (!from && !messagingServiceSid) || !contentSid) {
+            throw new Error(formatProviderConfigError(provider));
+        }
+
+        const digits = extractDigitsOrThrow(opts.to);
+        const toParam = `whatsapp:+${digits}`;
+        const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+
+        const params: Record<string, string> = {
+            To: toParam,
+            ...(messagingServiceSid ? { MessagingServiceSid: messagingServiceSid } : { From: from as string }),
+            ContentSid: contentSid,
+        };
+
+        // ContentVariables JSON
+        let contentVariables = process.env.TWILIO_CONTENT_VARIABLES_JSON;
+        if (opts.templateVariables && Object.keys(opts.templateVariables).length > 0) {
+            const normalized: Record<string, string> = {};
+            for (const [k, v] of Object.entries(opts.templateVariables)) normalized[String(k)] = String(v);
+            contentVariables = JSON.stringify(normalized);
+        }
+        if (contentVariables) {
+            try {
+                const parsed = JSON.parse(contentVariables);
+                if (parsed && typeof parsed === "object" && parsed.message === undefined) (parsed as any).message = opts.message;
+                contentVariables = JSON.stringify(parsed);
+            } catch {
+                contentVariables = JSON.stringify({ message: opts.message });
+            }
+        } else {
+            contentVariables = JSON.stringify({ message: opts.message });
+        }
+        params["ContentVariables"] = contentVariables;
+
+        // Optional delivery callback (useful for debugging async failures)
+        const statusCallback = String(process.env.TWILIO_STATUS_CALLBACK_URL || "").trim();
+        if (statusCallback) {
+            params["StatusCallback"] = statusCallback;
+        }
+
+        try {
+            const sendResp = await axios.post(url, new URLSearchParams(params).toString(), {
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                auth: { username: accountSid, password: authToken },
+                timeout: 10000,
+            });
+            const sid = sendResp?.data?.sid as string | undefined;
+
+            // Twilio accepts the request but delivery can still fail asynchronously.
+            // Fetch the message resource once to surface immediate errors/status.
+            let status: string | undefined = sendResp?.data?.status;
+            let errorCode: any = sendResp?.data?.error_code;
+            let errorMessage: any = sendResp?.data?.error_message;
+            if (sid) {
+                try {
+                    const msgUrl = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages/${sid}.json`;
+                    const msgResp = await axios.get(msgUrl, {
+                        auth: { username: accountSid, password: authToken },
+                        timeout: 10000,
+                    });
+                    status = msgResp?.data?.status ?? status;
+                    errorCode = msgResp?.data?.error_code ?? errorCode;
+                    errorMessage = msgResp?.data?.error_message ?? errorMessage;
+                } catch {
+                    // ignore; initial send response still useful
+                }
+            }
+
+            return { provider: "twilio", to: digits, mode: "twilio-template", sid, status, errorCode, errorMessage };
+        } catch (e: any) {
+            throw new Error(`Twilio WhatsApp send failed: ${extractAxiosErrorMessage(e)}`);
+        }
+    }
+
+    // Cloud provider
+    const token = process.env.WHATSAPP_TOKEN;
+    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+    if (!token || !phoneNumberId) {
+        throw new Error(formatProviderConfigError(provider));
+    }
+
+    const digits = extractDigitsOrThrow(opts.to);
+    const url = `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`;
+
+    try {
+        await axios.post(
+            url,
+            {
+                messaging_product: "whatsapp",
+                to: digits,
+                type: "text",
+                text: { body: opts.message },
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                },
+                timeout: 10000,
+            }
+        );
+        return { provider: "cloud", to: digits, mode: "cloud-text" };
+    } catch (e: any) {
+        // If outside window, try template; otherwise bubble error
+        if (!isOutsideWindowError(e)) {
+            throw new Error(`WhatsApp Cloud send failed: ${extractAxiosErrorMessage(e)}`);
+        }
+
+        // Template fallback (strict)
+        const templateName = (process.env.WHATSAPP_TEMPLATE_NAME || "payment_confirmation").trim();
+        const languageCode = (process.env.WHATSAPP_TEMPLATE_LANGUAGE_CODE || "en_US").trim();
+        if (!templateName || !languageCode) {
+            throw new Error("WhatsApp Cloud template fallback not configured (WHATSAPP_TEMPLATE_NAME / WHATSAPP_TEMPLATE_LANGUAGE_CODE).");
+        }
+        try {
+            await axios.post(
+                url,
+                {
+                    messaging_product: "whatsapp",
+                    to: digits,
+                    type: "template",
+                    template: {
+                        name: templateName,
+                        language: { code: languageCode },
+                        components: [
+                            {
+                                type: "body",
+                                parameters: [{ type: "text", text: opts.message }],
+                            },
+                        ],
+                    },
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${token}`,
+                        "Content-Type": "application/json",
+                    },
+                    timeout: 10000,
+                }
+            );
+            return { provider: "cloud", to: digits, mode: "cloud-template" };
+        } catch (e2: any) {
+            throw new Error(`WhatsApp Cloud template send failed: ${extractAxiosErrorMessage(e2)}`);
+        }
+    }
+}
+
 function resolveOverrideDigits(): string | undefined {
     const override = process.env.WHATSAPP_OVERRIDE_TO?.trim();
     if (!override) return undefined;

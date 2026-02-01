@@ -23,7 +23,7 @@ import eventBus from "../bus/eventBusSingleton";
 import { AppDataSource } from "../db/config";
 import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
-import { composePaidMessage, sendWhatsAppMessage } from "../services/whatsappService";
+import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict } from "../services/whatsappService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -490,6 +490,67 @@ export const unpayExternalInvoiceHandler = async (req: Request, res: Response) =
     const message = (error as any)?.message || "Failed to unpay invoice";
     if (message === 'Invoice not found') return sendResponse(res, false, 404, message);
     res.status(500).json({ message: "Failed to unpay invoice" });
+  }
+};
+
+export const remindExternalInvoiceHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId, 10);
+    if (!Number.isFinite(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const invoice = await repo.findOne({ where: { id: invoiceId } });
+    if (!invoice) {
+      return sendResponse(res, false, 404, "External invoice not found");
+    }
+
+    const phone = String(invoice.phoneNumber || "").trim();
+    if (!phone) {
+      return sendResponse(res, false, 400, "External invoice has no phone number");
+    }
+    // Guard against placeholder numbers used during import.
+    // Allow bypass only when a test override is configured.
+    if (phone === "9613000000" && String(process.env.WHATSAPP_OVERRIDE_TO || "").trim().length === 0) {
+      return sendResponse(
+        res,
+        false,
+        400,
+        "External invoice phoneNumber is a placeholder (9613000000). Update the invoice phoneNumber or set WHATSAPP_OVERRIDE_TO for testing."
+      );
+    }
+
+    const amountValue = typeof invoice.amount === "number" ? invoice.amount.toFixed(2) : String(invoice.amount ?? "");
+    const month = invoice.billingMonth ? String(invoice.billingMonth).slice(0, 10) : "";
+    const name = invoice.fullName || invoice.username || "Customer";
+
+    const message =
+      `Hi ${name}, this is a payment reminder for Invoice #${invoice.id}` +
+      (month ? ` (Billing month: ${month})` : "") +
+      (amountValue ? `, amount: $${amountValue}` : "") +
+      `. Status: ${invoice.status || "unpaid"}. Thank you.`;
+
+    const result = await sendWhatsAppMessageStrict({
+      to: phone,
+      message,
+      // Reuse the same 3 variables pattern used elsewhere (twilio/cloud templates)
+      templateVariables: {
+        "1": String(name),
+        "2": String(invoice.id ?? ""),
+        "3": String(amountValue),
+      },
+    });
+
+    // Optional: mark last action (best-effort; don't fail reminder if update fails)
+    try {
+      await repo.update({ id: invoiceId }, { lastAction: `reminded by ${req.user?.username || "system"} @ ${new Date().toISOString()}` });
+    } catch {}
+
+    return sendResponse(res, true, 200, "Reminder sent", { ok: true, ...result });
+  } catch (error: any) {
+    console.error("Error sending external invoice reminder:", error);
+    return sendResponse(res, false, 500, error?.message || "Failed to send reminder");
   }
 };
 

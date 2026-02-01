@@ -338,7 +338,8 @@ function mergeExternalInvoices(
                 username: sourceItem.username,
                 fullName: sourceItem.fullName,
                 email: sourceItem.email || "",
-                phoneNumber: sourceItem.phoneNumber || "9613000000",
+                // Do NOT inject placeholder phone numbers; keep empty so reminders can fail loudly.
+                phoneNumber: sourceItem.phoneNumber || "",
                 address: sourceItem.address,
                 billingMonth,
                 provider: sourceItem.provider,
@@ -346,7 +347,7 @@ function mergeExternalInvoices(
         }
 
         // New record — keep as-is
-        return { ...item, email: "", phoneNumber: "9613000000", billingMonth };
+        return { ...item, email: item.email || "", phoneNumber: (item as any).phoneNumber || "", billingMonth };
     });
 }
 

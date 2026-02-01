@@ -43,6 +43,28 @@ export class QuotaService {
       const userProfileRepository = queryRunner.manager.getRepository(Raduserprofile);
       await userProfileRepository.update({ username }, { isFallback: false });
 
+      // Step 3b (best-effort): if the user was moved to the "Fallback" profile by quota procedures,
+      // restore their original/default profile when available (user_default_profiles).
+      // This avoids users getting stuck on the fallback 256k profile after quota reset.
+      try {
+        await queryRunner.query(
+          `
+          UPDATE raduserprofile up
+          LEFT JOIN user_default_profiles udp
+            ON udp.username = up.username
+          SET
+            up.profile_id = COALESCE(udp.default_profile_id, up.profile_id),
+            up.is_fallback = 0
+          WHERE up.username = ?
+            AND up.profile_id = (SELECT id FROM radprofile WHERE profile_name = 'Fallback' LIMIT 1);
+          `,
+          [username]
+        );
+      } catch (e: any) {
+        // Don't fail quota reset if optional table doesn't exist.
+        console.warn("resetDailyQuota: unable to restore default profile:", e?.message || e);
+      }
+
       // Commit the transaction
       await queryRunner.commitTransaction();
 
@@ -105,9 +127,33 @@ export class QuotaService {
         [username]
       );
 
-      // Clear monthly exceeded + fallback flags for the user.
-      const userProfileRepository = queryRunner.manager.getRepository(Raduserprofile);
-      await userProfileRepository.update({ username }, { isMonthlyExceeded: false, isFallback: false });
+      // Clear exceeded/fallback flags and (best-effort) restore default profile if user is on the "Fallback" profile.
+      // Note: the RADIUS quota procedures switch profile_id to the fallback profile; without restoring it here,
+      // users can remain stuck on 256k even after resetting usage.
+      try {
+        await queryRunner.query(
+          `
+          UPDATE raduserprofile up
+          LEFT JOIN user_default_profiles udp
+            ON udp.username = up.username
+          SET
+            up.is_monthly_exceeded = 0,
+            up.is_fallback = 0,
+            up.profile_id = COALESCE(udp.default_profile_id, up.profile_id)
+          WHERE up.username = ?
+            AND (
+              up.is_monthly_exceeded = 1
+              OR up.profile_id = (SELECT id FROM radprofile WHERE profile_name = 'Fallback' LIMIT 1)
+            );
+          `,
+          [username]
+        );
+      } catch (e: any) {
+        // Fallback: clear flags using ORM mapping even if optional table doesn't exist.
+        const userProfileRepository = queryRunner.manager.getRepository(Raduserprofile);
+        await userProfileRepository.update({ username }, { isMonthlyExceeded: false, isFallback: false });
+        console.warn("resetMonthlyQuota: unable to restore default profile:", e?.message || e);
+      }
 
       await queryRunner.commitTransaction();
 

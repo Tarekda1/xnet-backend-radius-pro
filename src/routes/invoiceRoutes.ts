@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalInvoicesHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalInvoicesHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler } from "../controllers/invoiceController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({ dest: "uploads/" }); // temp folder
@@ -35,6 +35,17 @@ router.post(
   payExternalInvoiceHandler
 );
 router.post("/external/unpay/:invoiceId", authenticateToken, authorizePermissions('billing.externalInvoices.unpay'), unpayExternalInvoiceHandler);
+router.post(
+  "/external/:invoiceId/remind",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay",
+    "billing.externalInvoices.unpay"
+  ),
+  remindExternalInvoiceHandler
+);
 router.put("/external/:invoiceId",authenticateToken, updateExternalInvoiceHandler);
 router.delete("/external/:invoiceId", authenticateToken,deleteExternalInvoiceHandler);
 router.post("/external/bulk-delete", authenticateToken, authorizeRoles('admin','manager'), bulkDeleteExternalInvoicesHandler);

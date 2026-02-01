@@ -410,10 +410,7 @@ async function mikrotikExport(host: string, opts?: { username?: string; password
     timeout,
   });
 
-  try {
-    await conn.connect();
-    const rows: any = await conn.write("/export", ["=terse=yes"]);
-
+  const normalize = (rows: any): string => {
     // node-routeros export shapes vary; normalize into a string
     if (typeof rows === "string") return rows;
     if (Array.isArray(rows)) {
@@ -422,12 +419,35 @@ async function mikrotikExport(host: string, opts?: { username?: string; password
         if (r?.ret) return String(r.ret);
         if (r?.text) return String(r.text);
         if (r?.message) return String(r.message);
-        // If object, best-effort stringify
+        // Some RouterOS sentences return keys like "!re" / "!done" etc; keep best-effort output
         return Object.keys(r || {}).length ? JSON.stringify(r) : "";
       });
       return parts.filter((p) => p.trim().length > 0).join("\n");
     }
-    return JSON.stringify(rows);
+    return rows == null ? "" : JSON.stringify(rows);
+  };
+
+  try {
+    await conn.connect();
+
+    // RouterOS "/export" is not a typical "print" command; some devices/libs return empty for certain flags.
+    // Try a couple of variants to maximize compatibility.
+    const attempts: Array<() => Promise<any>> = [
+      () => conn.write("/export"),
+      () => conn.write("/export", ["=terse=yes"]),
+    ];
+
+    let last: any = null;
+    for (const run of attempts) {
+      last = await run();
+      const out = normalize(last).trim();
+      if (out.length > 0) return out + "\n";
+    }
+
+    throw new Error(
+      `MikroTik export returned empty output (host=${routerIP}, user=${username}, port=${apiPort}). ` +
+        `Last response: ${typeof last === "string" ? last : JSON.stringify(last)}`
+    );
   } finally {
     try {
       await conn.close();
@@ -444,6 +464,10 @@ async function createMikrotikBackup(host: string): Promise<BackupMeta> {
   const outPath = path.join(dir, filename);
 
   const content = await mikrotikExport(host);
+  if (!content.trim().length) {
+    // Safety net: never create empty export files (these confuse users on download).
+    throw new Error("MikroTik export produced empty output");
+  }
   await fsp.writeFile(outPath, content, "utf8");
   const st = await fsp.stat(outPath);
 
