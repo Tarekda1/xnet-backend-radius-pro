@@ -31,6 +31,8 @@ export const PERMISSIONS = [
   // Users section
   "users.view",
   "users.online.view",
+  "users.resetDailyQuota",
+  "users.resetMonthlyQuota",
 
   // Radius settings section
   "radius.settings.view",

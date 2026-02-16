@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { getOnlineUsersMetrics, getOnlineUsersWithUsage, disconnectOnlineUser, getAuthMetrics, getUserSessions, getLiveSessionDetail, getUserRejects } from "../controllers/sessionController";
+import { getOnlineUsersMetrics, getOnlineUsersWithUsage, disconnectOnlineUser, getAuthFailures, getAuthMetrics, getNocHealth, getNocSnapshot, getUserSessions, getLiveSessionDetail, getUserRejects } from "../controllers/sessionController";
 import { authenticateToken, authorizeAnyPermissions } from "../middleware/authMiddleware";
 
 const router = Router();
@@ -10,6 +10,9 @@ router.get("/sessions/live/:username", authenticateToken, authorizeAnyPermission
 router.get("/sessions/rejects/:username", authenticateToken, authorizeAnyPermissions('users.online.view', 'users.view', 'reseller.users.view'), getUserRejects);
 router.get("/sessions/user/:username", authenticateToken, authorizeAnyPermissions('users.view', 'reseller.users.view'), getUserSessions);
 router.get("/auth-metrics", authenticateToken, authorizeAnyPermissions('dashboard.widget.invoiceCounts', 'admin.analytics.view', 'users.online.view'), getAuthMetrics);
+router.get("/noc-snapshot", authenticateToken, authorizeAnyPermissions('users.online.view', 'reseller.users.view'), getNocSnapshot);
+router.get("/noc-health", authenticateToken, authorizeAnyPermissions('users.online.view', 'reseller.users.view'), getNocHealth);
+router.get("/auth-failures", authenticateToken, authorizeAnyPermissions('users.online.view', 'reseller.users.view'), getAuthFailures);
 router.post("/sessions/disconnect", authenticateToken, authorizeAnyPermissions('users.online.view', 'reseller.users.manage'), disconnectOnlineUser);
 
 

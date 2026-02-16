@@ -59,7 +59,7 @@ export const ProfileController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { profileName, dailyQuota, monthlyQuota, nightStart, nightEnd, speedDown, speedUp, sessionTimeout, idleTimeout, maxSessions } = req.body;
+            const { profileName, dailyQuota, monthlyQuota, price, nightStart, nightEnd, speedDown, speedUp, sessionTimeout, idleTimeout, maxSessions } = req.body;
             try {
                 const profileRepository = AppDataSource.getRepository(Radprofile);
                 const existingProfile = await profileRepository.findOne({ where: { profileName } });
@@ -71,6 +71,7 @@ export const ProfileController = {
                 profile.profileName = profileName;
                 profile.dailyQuota = dailyQuota;
                 profile.monthlyQuota = monthlyQuota;
+                profile.price = price != null ? Number(price) : 0;
                 profile.nightStart = nightStart;
                 profile.nightEnd = nightEnd;
                 profile.speedDown = speedDown;
@@ -99,7 +100,7 @@ export const ProfileController = {
             }
 
             const { id } = req.params;
-            const { profileName, dailyQuota, monthlyQuota, nightStart, nightEnd, speedDown, speedUp, sessionTimeout, idleTimeout, maxSessions } = req.body;
+            const { profileName, dailyQuota, monthlyQuota, price, nightStart, nightEnd, speedDown, speedUp, sessionTimeout, idleTimeout, maxSessions } = req.body;
             try {
                 const profileRepository = AppDataSource.getRepository(Radprofile);
                 const profile = await profileRepository.findOne({ where: { id: Number(id) } });
@@ -110,6 +111,7 @@ export const ProfileController = {
                 profile.profileName = profileName;
                 profile.dailyQuota = dailyQuota;
                 profile.monthlyQuota = monthlyQuota;
+                if (price != null) profile.price = Number(price);
                 profile.nightStart = nightStart;
                 profile.nightEnd = nightEnd;
                 profile.speedDown = speedDown;

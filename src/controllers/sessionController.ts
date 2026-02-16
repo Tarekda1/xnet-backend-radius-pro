@@ -185,6 +185,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       .createQueryBuilder("ra")
       .leftJoin(Raduserprofile, "userProfile", "ra.username = userProfile.username")
       .leftJoin(UserDetails, "userDetails", "ra.username = userDetails.username")
+      .leftJoin(Nas, "nas", "nas.nasname = ra.nasipaddress")
       .select("COUNT(DISTINCT ra.username)", "cnt")
       .where("ra.acctstoptime IS NULL")
       .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff });
@@ -192,10 +193,10 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
     if (search) {
       totalQb.andWhere(
         new Brackets((qb) => {
-          qb.where("LOWER(ra.username) LIKE :search", { search: `%${search}%` }).orWhere(
-            "LOWER(userDetails.full_name) LIKE :search",
-            { search: `%${search}%` }
-          );
+          qb.where("LOWER(ra.username) LIKE :search", { search: `%${search}%` })
+            .orWhere("LOWER(userDetails.full_name) LIKE :search", { search: `%${search}%` })
+            .orWhere("LOWER(COALESCE(ra.nasipaddress, '')) LIKE :search", { search: `%${search}%` })
+            .orWhere("LOWER(COALESCE(nas.shortname, nas.nasname, '')) LIKE :search", { search: `%${search}%` });
         })
       );
     }
@@ -248,6 +249,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       )
       .leftJoin(Raduserprofile, "userProfile", "ra.username = userProfile.username")
       .leftJoin(Radprofile, "profile", "userProfile.profileId = profile.id")
+      .leftJoin(Nas, "nas", "nas.nasname = ra.nasipaddress")
       .leftJoinAndMapOne(
         "user.userDetails",
         UserDetails,
@@ -257,6 +259,8 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       .select([
         "ra.username AS session_username",
         "COALESCE(st.mac_address, ra.callingstationid, '') AS session_mac_address",
+        "COALESCE(ra.nasipaddress, '') AS session_nas_ip",
+        "COALESCE(nas.shortname, nas.nasname, '') AS session_nas_name",
         "ra.acctstarttime AS session_start_time",
         "COALESCE(ra.acctupdatetime, ra.acctstarttime) AS session_last_update",
         "ra.acctsessiontime AS session_session_time",
@@ -279,7 +283,9 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
       .andWhere(new Brackets(qb => {
         qb.where("LOWER(ra.username) LIKE :search", { search: `%${search}%` })
-          .orWhere("LOWER(userDetails.fullName) LIKE :search", { search: `%${search}%` });
+          .orWhere("LOWER(userDetails.fullName) LIKE :search", { search: `%${search}%` })
+          .orWhere("LOWER(COALESCE(ra.nasipaddress, '')) LIKE :search", { search: `%${search}%` })
+          .orWhere("LOWER(COALESCE(nas.shortname, nas.nasname, '')) LIKE :search", { search: `%${search}%` });
       }))
       .andWhere(new Brackets((qb) => {
         if (!isReseller) return;
@@ -290,6 +296,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         ra.acctinputoctets, ra.acctoutputoctets,
         usage.data_usage, monthlyUsage.monthly_usage, dailyUsage.daily_usage,
         profile.profileName, profile.dailyQuota, profile.monthlyQuota, userProfile.is_fallback,
+        ra.nasipaddress, nas.shortname, nas.nasname,
         userDetails.fullName`)
       .orderBy("COALESCE(ra.acctupdatetime, ra.acctstarttime)", "DESC")
       .limit(limit)
@@ -532,6 +539,254 @@ export const disconnectOnlineUser = async (req: Request, res: Response) => {
     }
   } catch (error) {
     console.error("Error disconnecting user:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+export const getNocSnapshot = async (req: Request, res: Response) => {
+  try {
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    const now = new Date();
+    const start24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+    const trendRows = await AppDataSource.getRepository(ConnectionLogs)
+      .createQueryBuilder("cl")
+      .select("DATE_FORMAT(cl.timestamp, '%Y-%m-%d %H:00:00')", "bucket")
+      .addSelect("COALESCE(SUM(cl.status = 'attempt'), 0)", "attempts")
+      .addSelect("COALESCE(SUM(cl.status = 'rejected'), 0)", "rejected")
+      .where("cl.timestamp >= :start24h", { start24h })
+      .andWhere("cl.timestamp <= :now", { now })
+      .groupBy("bucket")
+      .orderBy("bucket", "ASC")
+      .getRawMany<{ bucket: string; attempts: string; rejected: string }>();
+
+    const authRejectTrend = trendRows.map((row) => {
+      const attempts = Number(row?.attempts ?? 0);
+      const rejected = Number(row?.rejected ?? 0);
+      const rejectRate = attempts > 0 ? (rejected / attempts) * 100 : 0;
+      return {
+        bucket: row.bucket,
+        attempts,
+        rejected,
+        rejectRate: Number(rejectRate.toFixed(2)),
+      };
+    });
+
+    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+
+    const nasQb = AppDataSource.getRepository(Radacct)
+      .createQueryBuilder("ra")
+      .leftJoin(Nas, "n", "n.nasname = ra.nasipaddress")
+      .select("COALESCE(ra.nasipaddress, 'Unknown')", "nasIp")
+      .addSelect("COALESCE(n.shortname, n.nasname, ra.nasipaddress, 'Unknown')", "nasLabel")
+      .addSelect("COUNT(*)", "sessions")
+      .where("ra.acctstoptime IS NULL")
+      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff });
+
+    if (isReseller) {
+      nasQb.innerJoin(
+        Raduserprofile,
+        "u",
+        "u.username = ra.username AND u.owner_reseller_id = :rid",
+        { rid: resellerId }
+      );
+    }
+
+    const nasRows = await nasQb
+      .groupBy("ra.nasipaddress, n.shortname, n.nasname")
+      .orderBy("sessions", "DESC")
+      .limit(5)
+      .getRawMany<{ nasIp: string; nasLabel: string; sessions: string }>();
+
+    const topNasBySessions = nasRows.map((row) => ({
+      nasIp: row?.nasIp || "Unknown",
+      nasLabel: row?.nasLabel || "Unknown",
+      sessions: Number(row?.sessions ?? 0),
+    }));
+
+    res.status(200).json({
+      success: true,
+      data: {
+        generatedAt: now.toISOString(),
+        authRejectTrend,
+        topNasBySessions,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching NOC snapshot:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+export const getNocHealth = async (req: Request, res: Response) => {
+  const startedAt = Date.now();
+  try {
+    const dbStart = Date.now();
+    await AppDataSource.query("SELECT 1");
+    const dbLatencyMs = Math.max(0, Date.now() - dbStart);
+
+    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
+    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
+    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+
+    const activeSessionsRow = await AppDataSource.getRepository(Radacct)
+      .createQueryBuilder("ra")
+      .select("COUNT(*)", "cnt")
+      .where("ra.acctstoptime IS NULL")
+      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
+      .getRawOne<{ cnt: string }>();
+
+    const activeSessions = Number(activeSessionsRow?.cnt ?? 0);
+    const serverProcessingMs = Math.max(0, Date.now() - startedAt);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        generatedAt: new Date().toISOString(),
+        dbLatencyMs,
+        serverProcessingMs,
+        activeSessions,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching NOC health:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+export const getAuthFailures = async (req: Request, res: Response) => {
+  try {
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    const fromRaw = String(req.query.from ?? "").trim();
+    const toRaw = String(req.query.to ?? "").trim();
+    const from = fromRaw ? new Date(fromRaw) : new Date(Date.now() - 60 * 60 * 1000);
+    const to = toRaw ? new Date(toRaw) : new Date();
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from >= to) {
+      res.status(400).json({ success: false, message: "Invalid from/to range" });
+      return;
+    }
+
+    const pageRaw = parseInt(String(req.query.page ?? "1"), 10);
+    const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+
+    // Backward compatibility: if old `limit` is sent, use it as pageSize.
+    const pageSizeRaw = parseInt(String(req.query.pageSize ?? req.query.limit ?? "50"), 10);
+    const pageSize = Number.isFinite(pageSizeRaw) ? Math.min(Math.max(pageSizeRaw, 1), 500) : 50;
+    const offset = (page - 1) * pageSize;
+
+    const statusRaw = String(req.query.status ?? "all").trim().toLowerCase();
+    const statusFilter = ["rejected", "timeout", "error"].includes(statusRaw) ? statusRaw : "all";
+    const search = String(req.query.q ?? "").trim().toLowerCase();
+
+    const repo = AppDataSource.getRepository(ConnectionLogs);
+    const baseQb = repo
+      .createQueryBuilder("cl")
+      .where("cl.timestamp >= :from", { from })
+      .andWhere("cl.timestamp < :to", { to })
+      .andWhere("cl.status IN ('rejected','timeout','error')");
+
+    if (statusFilter !== "all") {
+      baseQb.andWhere("cl.status = :status", { status: statusFilter });
+    }
+
+    if (search) {
+      baseQb.andWhere(
+        new Brackets((sub) => {
+          sub
+            .where("LOWER(COALESCE(cl.username, '')) LIKE :search", { search: `%${search}%` })
+            .orWhere("LOWER(COALESCE(cl.nasIp, '')) LIKE :search", { search: `%${search}%` })
+            .orWhere("LOWER(COALESCE(cl.macAddress, '')) LIKE :search", { search: `%${search}%` });
+        })
+      );
+    }
+
+    if (isReseller) {
+      baseQb.innerJoin(
+        Raduserprofile,
+        "u",
+        "u.username = cl.username AND u.owner_reseller_id = :rid",
+        { rid: resellerId }
+      );
+    }
+
+    const totalRow = await baseQb.clone().select("COUNT(*)", "cnt").getRawOne<{ cnt: string }>();
+    const total = Number(totalRow?.cnt ?? 0);
+
+    const pagedRows = await baseQb
+      .clone()
+      .select([
+        "cl.id AS id",
+        "cl.timestamp AS timestamp",
+        "cl.username AS username",
+        "cl.nasIp AS nasIp",
+        "cl.macAddress AS macAddress",
+        "cl.status AS status",
+      ])
+      .orderBy("cl.timestamp", "DESC")
+      .limit(pageSize)
+      .offset(offset)
+      .getRawMany<{
+        id: number;
+        timestamp: string;
+        username: string | null;
+        nasIp: string | null;
+        macAddress: string | null;
+        status: string | null;
+      }>();
+
+    const topUsersRows = await baseQb
+      .clone()
+      .select("COALESCE(cl.username, '-')", "username")
+      .addSelect("COUNT(*)", "count")
+      .groupBy("COALESCE(cl.username, '-')")
+      .orderBy("count", "DESC")
+      .limit(5)
+      .getRawMany<{ username: string; count: string }>();
+
+    const topNasRows = await baseQb
+      .clone()
+      .select("COALESCE(cl.nasIp, '-')", "nasIp")
+      .addSelect("COUNT(*)", "count")
+      .groupBy("COALESCE(cl.nasIp, '-')")
+      .orderBy("count", "DESC")
+      .limit(5)
+      .getRawMany<{ nasIp: string; count: string }>();
+
+    res.status(200).json({
+      success: true,
+      data: {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        count: pagedRows.length,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+        currentPage: page,
+        pageSize,
+        rows: pagedRows,
+        summary: {
+          topUsers: topUsersRows.map((r) => ({
+            username: r.username || "-",
+            count: Number(r.count ?? 0),
+          })),
+          topNas: topNasRows.map((r) => ({
+            nasIp: r.nasIp || "-",
+            count: Number(r.count ?? 0),
+          })),
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching auth failures:", error);
     res.status(500).json({ success: false, message: "Server Error" });
   }
 };

@@ -38,6 +38,8 @@ import { CableVisionAccount } from './entities/CableVisionAccount';
 import { CableVisionProfile } from './entities/CableVisionProfile';
 import { CableVisionInvoice } from './entities/CableVisionInvoice';
 
+import { AddQuotaResetPermissions1769900001000 } from './migrations/1769900001000-AddQuotaResetPermissions';
+
 // Create entities array with explicit references
 const entities = [
     BlockedMacs,
@@ -85,7 +87,8 @@ export const AppDataSource = new DataSource({
     migrations: [
         process.env.NODE_ENV === 'production' 
             ? "dist/db/migrations/**/*.js" 
-            : "src/db/migrations/**/*.ts"
+            : "src/db/migrations/**/*.ts",
+        AddQuotaResetPermissions1769900001000
     ],
     subscribers: [SessionTrackingSubscriber]
 });

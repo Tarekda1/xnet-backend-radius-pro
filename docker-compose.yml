@@ -189,7 +189,7 @@ services:
       - clickhouse_data:/var/lib/clickhouse
       - ./observability/clickhouse/init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "8123:8123"   # HTTP
+      - "18123:8123"   # HTTP (host 18123 to avoid Windows Hyper-V port conflict)
       - "9000:9000"   # Native
     networks:
       - backend_network
