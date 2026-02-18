@@ -136,7 +136,7 @@ export const payInvoice = async (invoiceId: number) => {
     return invoice;
 };
 
-export const collectInvoice = async (invoiceId: number, collectorUsername: string, paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' = 'cash') => {
+export const collectInvoice = async (invoiceId: number, collectorUsername: string, paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' = 'cash') => {
     const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
     const invoice = await invoiceRepo.findOne({ where: { id: invoiceId } });
@@ -256,7 +256,7 @@ export const reconcileBulkCash = async (params: {
 export const payExternalInvoice = async (
     invoiceId: number,
     actorUsername: string,
-    paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' = 'cash'
+    paymentMethod: 'cash' | 'pos' | 'transfer' | 'other' | 'gateway' = 'cash'
 ) => {
     const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 

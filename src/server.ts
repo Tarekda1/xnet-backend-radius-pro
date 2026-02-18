@@ -24,6 +24,7 @@ import { startConsumer } from './bus/userActionsConsumer';
 import nasRoutes from './routes/nasRoutes';
 import cron from "node-cron";
 import { generateMonthlyInvoices } from './services/invoiceService';
+import { runExternalDunningSystemJob } from './controllers/invoiceController';
 import { SessionTrackingWatcher } from './watchers/SessionTrackingWatcher';
 import { WebSocket, WebSocketServer } from 'ws';
 import invoiceRoutes from './routes/invoiceRoutes';
@@ -103,7 +104,20 @@ wss.on('connection', (ws: any) => {
     // Handle app-level websocket messages
     ws.on('message', async (message: any) => {
       try {
-        const data = JSON.parse(message.toString());
+        const raw = typeof message === "string" ? message : message?.toString?.() ?? "";
+        const text = String(raw || "").trim();
+        if (!text) return;
+
+        // Ignore non-JSON frames (e.g. proxy/STOMP CONNECT prefaces).
+        const looksJson = text.startsWith("{") || text.startsWith("[");
+        if (!looksJson) {
+          console.warn("Ignoring non-JSON websocket frame");
+          return;
+        }
+
+        const data = JSON.parse(text);
+        if (!data || typeof data !== "object") return;
+
         if (ws.readyState === WebSocket.OPEN) {
           try {
             await eventBus.publish({
@@ -193,6 +207,26 @@ const monthlyInvoiceTask = cron.schedule("0 0 1 * *", async () => {
     console.log("Running monthly invoice generation...");
     await generateMonthlyInvoices();
   });
+
+const dunningCronExpr = String(process.env.DUNNING_CRON ?? "").trim();
+const dunningTask = dunningCronExpr
+  ? cron.schedule(dunningCronExpr, async () => {
+      try {
+        const result = await runExternalDunningSystemJob();
+        console.log("[dunning] run complete", {
+          attempted: result.attempted,
+          sent: result.sent,
+          failed: result.failed,
+          skippedNoPhone: (result as any).skippedNoPhone,
+        });
+      } catch (e) {
+        console.error("[dunning] run failed", e);
+      }
+    })
+  : null;
+if (dunningTask) {
+  console.log(`[dunning] scheduler enabled: ${dunningCronExpr}`);
+}
 
 // RADIUS server setup
 const radiusServer = dgram.createSocket('udp4');
@@ -302,6 +336,9 @@ async function shutdown(signal: string) {
     // Stop cron jobs
     try {
       monthlyInvoiceTask.stop();
+    } catch {}
+    try {
+      dunningTask?.stop();
     } catch {}
 
     // Stop accepting new HTTP connections

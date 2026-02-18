@@ -23,10 +23,347 @@ import eventBus from "../bus/eventBusSingleton";
 import { AppDataSource } from "../db/config";
 import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
+import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict } from "../services/whatsappService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
+};
+
+type DunningCandidate = {
+  id: number;
+  username: string;
+  fullName: string;
+  phoneNumber: string;
+  status: string;
+  billingMonth: string;
+  amount: number;
+  overdueDays: number;
+  dueDate: string;
+};
+
+type DunningAction = "remind" | "throttle" | "suspend";
+type DunningStage = {
+  day: number;
+  action: DunningAction;
+  name?: string;
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const parseIntOrDefault = (value: unknown, fallback: number) => {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const parseStatuses = (value: unknown): string[] => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return ["unpaid", "pending"];
+  const allowed = new Set(["unpaid", "pending"]);
+  return raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => allowed.has(s));
+};
+
+const parseAsOfDate = (value: unknown): Date | null => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+};
+
+const computeDunningDates = (billingMonth: Date, graceDays: number, asOfDate?: Date | null) => {
+  const endOfMonth = new Date(billingMonth.getFullYear(), billingMonth.getMonth() + 1, 0);
+  endOfMonth.setHours(0, 0, 0, 0);
+  const dueDate = new Date(endOfMonth.getTime() + graceDays * DAY_MS);
+  dueDate.setHours(23, 59, 59, 999);
+  const now = asOfDate && !Number.isNaN(asOfDate.getTime()) ? asOfDate : new Date();
+  const overdueDays = Math.floor((now.getTime() - dueDate.getTime()) / DAY_MS);
+  return { dueDate, overdueDays };
+};
+
+const buildReminderMessage = (invoice: DunningCandidate) => {
+  const month = invoice.billingMonth ? String(invoice.billingMonth).slice(0, 10) : "";
+  const amountValue = typeof invoice.amount === "number" ? invoice.amount.toFixed(2) : String(invoice.amount ?? "");
+  const name = invoice.fullName || invoice.username || "Customer";
+  return (
+    `Hi ${name}, this is a payment reminder for Invoice #${invoice.id}` +
+    (month ? ` (Billing month: ${month})` : "") +
+    (amountValue ? `, amount: $${amountValue}` : "") +
+    `. Status: ${invoice.status || "unpaid"}. Thank you.`
+  );
+};
+
+const defaultDunningStages = (): DunningStage[] => {
+  const secondReminderDay = Math.max(0, parseIntOrDefault(process.env.DUNNING_SECOND_REMINDER_DAY, 3));
+  const throttleDay = Math.max(0, parseIntOrDefault(process.env.DUNNING_THROTTLE_DAY, 7));
+  const suspendDay = Math.max(0, parseIntOrDefault(process.env.DUNNING_SUSPEND_DAY, 14));
+  return [
+    { day: 0, action: "remind", name: "First Reminder" },
+    { day: secondReminderDay, action: "remind", name: "Second Reminder" },
+    { day: throttleDay, action: "throttle", name: "Throttle Service" },
+    { day: suspendDay, action: "suspend", name: "Suspend Service" },
+  ];
+};
+
+const parseDunningStages = (value: unknown): DunningStage[] => {
+  const fallback = defaultDunningStages();
+  let input = value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    try {
+      input = JSON.parse(value);
+    } catch {
+      input = null;
+    }
+  }
+  if (!Array.isArray(input)) return fallback;
+  const normalized = input
+    .map((raw) => {
+      const day = Math.max(0, parseIntOrDefault((raw as any)?.day, 0));
+      const action = String((raw as any)?.action || "").toLowerCase();
+      const name = String((raw as any)?.name || "").trim();
+      if (!["remind", "throttle", "suspend"].includes(action)) return null;
+      return { day, action: action as DunningAction, ...(name ? { name } : {}) };
+    })
+    .filter((x): x is DunningStage => Boolean(x));
+  if (normalized.length === 0) return fallback;
+  return normalized.sort((a, b) => a.day - b.day);
+};
+
+const parseSelectedActions = (value: unknown): DunningAction[] => {
+  const all: DunningAction[] = ["remind", "throttle", "suspend"];
+  if (value === undefined || value === null || String(value).trim() === "") return all;
+  const rawParts = Array.isArray(value) ? value.map(String) : String(value).split(",");
+  const allowed = new Set<DunningAction>(all);
+  const parsed = rawParts
+    .map((v) => String(v).trim().toLowerCase())
+    .filter((v): v is DunningAction => allowed.has(v as DunningAction));
+  return Array.from(new Set(parsed));
+};
+
+const detectInvoiceStage = (invoice: DunningCandidate, stages: DunningStage[]): DunningStage | null => {
+  const eligible = stages.filter((s) => invoice.overdueDays >= s.day);
+  if (eligible.length === 0) return null;
+  return eligible[eligible.length - 1];
+};
+
+const stageKey = (stage: DunningStage) => `dunning_stage:${stage.day}:${stage.action}`;
+
+const hasStageAlreadyApplied = (lastAction: string | null | undefined, stage: DunningStage): boolean => {
+  const marker = stageKey(stage);
+  return String(lastAction || "").includes(marker);
+};
+
+const applyDunningAction = async (params: {
+  invoice: DunningCandidate;
+  stage: DunningStage;
+  actor: string;
+  throttleProfileId?: number;
+}): Promise<{ ok: boolean; reason?: string; status: "sent" | "skipped" | "failed" }> => {
+  const repo = AppDataSource.getRepository(ExternalInvoice);
+  const userRepo = AppDataSource.getRepository(Raduserprofile);
+
+  const inv = await repo.findOne({ where: { id: params.invoice.id } });
+  if (!inv) return { ok: false, status: "failed", reason: "Invoice not found" };
+  if (hasStageAlreadyApplied(inv.lastAction, params.stage)) {
+    return { ok: true, status: "skipped", reason: "Stage already applied" };
+  }
+
+  try {
+    if (params.stage.action === "remind") {
+      if (!params.invoice.phoneNumber) return { ok: true, status: "skipped", reason: "Missing phone number" };
+      const amountValue = typeof params.invoice.amount === "number" ? params.invoice.amount.toFixed(2) : String(params.invoice.amount ?? "");
+      const name = params.invoice.fullName || params.invoice.username || "Customer";
+      await sendWhatsAppMessageStrict({
+        to: params.invoice.phoneNumber,
+        message: buildReminderMessage(params.invoice),
+        templateVariables: {
+          "1": String(name),
+          "2": String(params.invoice.id),
+          "3": String(amountValue),
+        },
+      });
+    } else if (params.stage.action === "throttle") {
+      const profileId = Number(params.throttleProfileId || 0);
+      if (!Number.isFinite(profileId) || profileId <= 0) {
+        return { ok: true, status: "skipped", reason: "Throttle profile not configured" };
+      }
+      await userRepo
+        .createQueryBuilder()
+        .update(Raduserprofile)
+        .set({ profileId } as any)
+        .where("username = :username", { username: params.invoice.username })
+        .execute();
+    } else if (params.stage.action === "suspend") {
+      await userRepo
+        .createQueryBuilder()
+        .update(Raduserprofile)
+        .set({ accountStatus: "suspended" } as any)
+        .where("username = :username", { username: params.invoice.username })
+        .execute();
+    }
+
+    await repo.update(
+      { id: params.invoice.id },
+      {
+        lastAction: `${stageKey(params.stage)} by ${params.actor} @ ${new Date().toISOString()}`,
+      }
+    );
+    return { ok: true, status: "sent" };
+  } catch (err: any) {
+    return { ok: false, status: "failed", reason: String(err?.message || "Action failed") };
+  }
+};
+
+const getDunningCandidates = async (params: {
+  statuses: string[];
+  graceDays: number;
+  limit: number;
+  minAmount: number;
+  asOfDate?: Date | null;
+}): Promise<DunningCandidate[]> => {
+  const repo = AppDataSource.getRepository(ExternalInvoice);
+  const statuses = params.statuses.length > 0 ? params.statuses : ["unpaid", "pending"];
+  const rows = await repo
+    .createQueryBuilder("ext")
+    .where("ext.deletedAt IS NULL")
+    .andWhere("ext.status IN (:...statuses)", { statuses })
+    .orderBy("ext.billingMonth", "ASC")
+    .take(Math.max(params.limit * 5, params.limit))
+    .getMany();
+
+  const filtered = rows
+    .filter((inv) => !inv.deletedAt)
+    .filter((inv) => Number(inv.amount || 0) >= params.minAmount)
+    .map((inv) => {
+      const billingMonth = new Date(inv.billingMonth as any);
+      if (Number.isNaN(billingMonth.getTime())) return null;
+      const { dueDate, overdueDays } = computeDunningDates(billingMonth, params.graceDays, params.asOfDate);
+      // Immediate mode: when graceDays is 0, include unpaid/pending invoices right away.
+      if (params.graceDays > 0 && overdueDays < 0) return null;
+      return {
+        id: Number(inv.id),
+        username: String(inv.username || ""),
+        fullName: String(inv.fullName || ""),
+        phoneNumber: String(inv.phoneNumber || "").trim(),
+        status: String(inv.status || "unpaid"),
+        billingMonth: String(inv.billingMonth || ""),
+        amount: Number(inv.amount || 0),
+        overdueDays: Math.max(0, overdueDays),
+        dueDate: dueDate.toISOString(),
+      } as DunningCandidate;
+    })
+    .filter((x): x is DunningCandidate => Boolean(x))
+    .sort((a, b) => (b.overdueDays - a.overdueDays) || (b.amount - a.amount));
+
+  return filtered.slice(0, params.limit);
+};
+
+const executeExternalDunning = async (params: {
+  actor: string;
+  graceDays: number;
+  maxCount: number;
+  minAmount: number;
+  dryRun: boolean;
+  statuses: string[];
+  asOfDate?: Date | null;
+  stages: DunningStage[];
+  selectedActions: DunningAction[];
+  throttleProfileId?: number;
+}) => {
+  const candidates = await getDunningCandidates({
+    statuses: params.statuses,
+    graceDays: params.graceDays,
+    limit: params.maxCount,
+    minAmount: params.minAmount,
+    asOfDate: params.asOfDate,
+  });
+
+  const result = {
+    dryRun: params.dryRun,
+    attempted: candidates.length,
+    sent: 0,
+    skippedNoPhone: 0,
+    skippedAlreadyApplied: 0,
+    failed: 0,
+    actionSummary: {
+      remind: 0,
+      throttle: 0,
+      suspend: 0,
+      none: 0,
+    },
+    details: [] as Array<{
+      id: number;
+      status: "sent" | "skipped" | "failed";
+      action?: DunningAction;
+      stageDay?: number;
+      reason?: string;
+    }>,
+  };
+
+  if (params.dryRun) {
+    const preview = candidates.map((invoice) => {
+      const stage = detectInvoiceStage(invoice, params.stages);
+      const effectiveStage = stage && params.selectedActions.includes(stage.action) ? stage : null;
+      return {
+        ...invoice,
+        stage: effectiveStage,
+      };
+    });
+    for (const row of preview) {
+      if (!row.stage) {
+        result.actionSummary.none += 1;
+        continue;
+      }
+      result.actionSummary[row.stage.action] += 1;
+      if (row.stage.action === "remind" && !row.phoneNumber) result.skippedNoPhone += 1;
+    }
+    return { ...result, preview };
+  }
+
+  const repo = AppDataSource.getRepository(ExternalInvoice);
+  for (const invoice of candidates) {
+    const stage = detectInvoiceStage(invoice, params.stages);
+    if (!stage) {
+      result.actionSummary.none += 1;
+      result.details.push({ id: invoice.id, status: "skipped", reason: "No eligible stage" });
+      continue;
+    }
+    if (!params.selectedActions.includes(stage.action)) {
+      result.actionSummary.none += 1;
+      result.details.push({ id: invoice.id, status: "skipped", action: stage.action, stageDay: stage.day, reason: "Action filtered out" });
+      continue;
+    }
+    result.actionSummary[stage.action] += 1;
+
+    const latest = await repo.findOne({ where: { id: invoice.id } });
+    if (hasStageAlreadyApplied(latest?.lastAction, stage)) {
+      result.skippedAlreadyApplied += 1;
+      result.details.push({ id: invoice.id, status: "skipped", action: stage.action, stageDay: stage.day, reason: "Stage already applied" });
+      continue;
+    }
+
+    const action = await applyDunningAction({
+      invoice,
+      stage,
+      actor: params.actor,
+      throttleProfileId: params.throttleProfileId,
+    });
+    if (action.status === "sent") result.sent += 1;
+    else if (action.status === "failed") result.failed += 1;
+    else if (action.reason === "Missing phone number") result.skippedNoPhone += 1;
+    result.details.push({
+      id: invoice.id,
+      status: action.status,
+      action: stage.action,
+      stageDay: stage.day,
+      reason: action.reason,
+    });
+  }
+
+  return result;
 };
 
 
@@ -134,7 +471,7 @@ export const collectInvoiceHandler = async (req: Request, res: Response) => {
     if (isNaN(invoiceId)) {
       return sendResponse(res, false, 400, "Invalid invoice ID");
     }
-    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other';
+    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other' | 'gateway';
     const username = req.user?.username || 'system';
 
     const invoice = await collectInvoice(invoiceId, username, paymentMethod);
@@ -413,7 +750,7 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
       return sendResponse(res, false, 400, "Invalid invoice ID");
     }
 
-    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other';
+    const paymentMethod = (req.body?.paymentMethod || 'cash') as 'cash' | 'pos' | 'transfer' | 'other' | 'gateway';
     const actor = req.user?.username || 'system';
 
     const invoice = await payExternalInvoice(invoiceId, actor, paymentMethod);
@@ -552,6 +889,108 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
     console.error("Error sending external invoice reminder:", error);
     return sendResponse(res, false, 500, error?.message || "Failed to send reminder");
   }
+};
+
+export const getExternalDunningPreviewHandler = async (req: Request, res: Response) => {
+  try {
+    const graceDays = Math.max(0, parseIntOrDefault(req.query.graceDays, 7));
+    const limit = Math.min(500, Math.max(1, parseIntOrDefault(req.query.limit, 100)));
+    const minAmount = Math.max(0, Number(req.query.minAmount ?? 0) || 0);
+    const statuses = parseStatuses(req.query.statuses);
+    const asOfDate = parseAsOfDate(req.query.asOfDate);
+    const stages = parseDunningStages(req.query.stages);
+    const selectedActions = parseSelectedActions(req.query.selectedActions);
+
+    const candidates = await getDunningCandidates({ statuses, graceDays, limit, minAmount, asOfDate });
+    const withoutPhone = candidates.filter((c) => !c.phoneNumber).length;
+    const readyToSend = candidates.length - withoutPhone;
+    const totalAmount = candidates.reduce((acc, c) => acc + Number(c.amount || 0), 0);
+    const actionSummary = {
+      remind: 0,
+      throttle: 0,
+      suspend: 0,
+      none: 0,
+    };
+    const withStage = candidates.map((c) => {
+      const stage = detectInvoiceStage(c, stages);
+      const effectiveStage = stage && selectedActions.includes(stage.action) ? stage : null;
+      if (!effectiveStage) actionSummary.none += 1;
+      else actionSummary[effectiveStage.action] += 1;
+      return { ...c, stage: effectiveStage };
+    });
+
+    return sendResponse(res, true, 200, "Dunning preview generated", {
+      graceDays,
+      asOfDate: asOfDate ? asOfDate.toISOString() : null,
+      statuses,
+      stages,
+      selectedActions,
+      totalCandidates: candidates.length,
+      readyToSend,
+      missingPhone: withoutPhone,
+      totalAmount,
+      actionSummary,
+      data: withStage,
+    });
+  } catch (error) {
+    console.error("Error generating dunning preview:", error);
+    return sendResponse(res, false, 500, "Failed to generate dunning preview");
+  }
+};
+
+export const runExternalDunningHandler = async (req: Request, res: Response) => {
+  try {
+    const graceDays = Math.max(0, parseIntOrDefault(req.body?.graceDays, 7));
+    const maxCount = Math.min(500, Math.max(1, parseIntOrDefault(req.body?.maxCount, 100)));
+    const minAmount = Math.max(0, Number(req.body?.minAmount ?? 0) || 0);
+    const dryRun = Boolean(req.body?.dryRun);
+    const statuses = parseStatuses(req.body?.statuses);
+    const asOfDate = parseAsOfDate(req.body?.asOfDate);
+    const stages = parseDunningStages(req.body?.stages);
+    const selectedActions = parseSelectedActions(req.body?.selectedActions);
+    const throttleProfileId = parseIntOrDefault(req.body?.throttleProfileId, parseIntOrDefault(process.env.DUNNING_THROTTLE_PROFILE_ID, 0));
+    const actor = req.user?.username || "system";
+
+    const result = await executeExternalDunning({
+      actor,
+      graceDays,
+      maxCount,
+      minAmount,
+      dryRun,
+      statuses,
+      asOfDate,
+      stages,
+      selectedActions,
+      throttleProfileId: throttleProfileId > 0 ? throttleProfileId : undefined,
+    });
+
+    return sendResponse(res, true, 200, "Dunning run completed", result);
+  } catch (error: any) {
+    console.error("Error running dunning campaign:", error);
+    return sendResponse(res, false, 500, error?.message || "Failed to run dunning campaign");
+  }
+};
+
+export const runExternalDunningSystemJob = async () => {
+  const graceDays = Math.max(0, parseIntOrDefault(process.env.DUNNING_GRACE_DAYS, 7));
+  const maxCount = Math.min(500, Math.max(1, parseIntOrDefault(process.env.DUNNING_MAX_COUNT, 200)));
+  const minAmount = Math.max(0, Number(process.env.DUNNING_MIN_AMOUNT ?? 0) || 0);
+  const statuses = parseStatuses(process.env.DUNNING_STATUSES || "unpaid,pending");
+  const stages = defaultDunningStages();
+  const selectedActions = parseSelectedActions(process.env.DUNNING_SELECTED_ACTIONS || "");
+  const throttleProfileId = parseIntOrDefault(process.env.DUNNING_THROTTLE_PROFILE_ID, 0);
+
+  return executeExternalDunning({
+    actor: "scheduler",
+    graceDays,
+    maxCount,
+    minAmount,
+    dryRun: false,
+    statuses,
+    stages,
+    selectedActions,
+    throttleProfileId: throttleProfileId > 0 ? throttleProfileId : undefined,
+  });
 };
 
 export const updateExternalInvoiceHandler = async (req: Request, res: Response) => {

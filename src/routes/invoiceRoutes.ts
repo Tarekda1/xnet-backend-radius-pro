@@ -1,6 +1,6 @@
 // src/routes/invoice.routes.ts
 import { Router } from "express";
-import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalInvoicesHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler } from "../controllers/invoiceController";
+import { bulkPayInvoicesHandler, bulkDeleteExternalInvoicesHandler, deleteExternalInvoiceHandler, generateInvoicesHandler, getExternalDunningPreviewHandler, getExternalInvoicesHandler, getInvoicesHandler, payExternalInvoiceHandler, unpayExternalInvoiceHandler, payInvoiceHandler, runExternalDunningHandler, updateExternalInvoiceHandler, uploadExternalInvoiceFile, collectInvoiceHandler, reconcileBulkCashHandler, reconcileInvoiceCashHandler, getCollectedMetricsHandler, getCollectorBreakdownHandler, getCollectedInvoicesListHandler, remindExternalInvoiceHandler } from "../controllers/invoiceController";
 import multer from "multer";
 import { authenticateToken, authorizeAnyPermissions, authorizePermissions, authorizeRoles } from '../middleware/authMiddleware';
 const upload = multer({ dest: "uploads/" }); // temp folder
@@ -45,6 +45,26 @@ router.post(
     "billing.externalInvoices.unpay"
   ),
   remindExternalInvoiceHandler
+);
+router.get(
+  "/external/dunning/preview",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay"
+  ),
+  getExternalDunningPreviewHandler
+);
+router.post(
+  "/external/dunning/run",
+  authenticateToken,
+  authorizeAnyPermissions(
+    "billing.externalInvoices.view",
+    "billing.externalInvoices.viewTotals",
+    "billing.externalInvoices.pay"
+  ),
+  runExternalDunningHandler
 );
 router.put("/external/:invoiceId",authenticateToken, updateExternalInvoiceHandler);
 router.delete("/external/:invoiceId", authenticateToken,deleteExternalInvoiceHandler);
