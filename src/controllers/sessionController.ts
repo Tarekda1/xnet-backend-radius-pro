@@ -445,6 +445,91 @@ export const getUserSessions = async (req: Request, res: Response) => {
   }
 };
 
+export const getUsageWindow = async (req: Request, res: Response) => {
+  try {
+    const username = String(req.query.username ?? "").trim();
+    if (!username) {
+      res.status(400).json({ success: false, message: "username is required" });
+      return;
+    }
+
+    const hoursRaw = parseInt(String(req.query.hours ?? "11"), 10);
+    const hours = Number.isFinite(hoursRaw) ? Math.min(Math.max(hoursRaw, 1), 24 * 31) : 11;
+
+    const role = (req.user as any)?.role as string | undefined;
+    const resellerIdRaw = (req.user as any)?.resellerId as number | null | undefined;
+    const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
+    const isReseller = role === "reseller" && !!resellerId;
+
+    const windowEnd = new Date();
+    const windowStart = new Date(windowEnd.getTime() - hours * 60 * 60 * 1000);
+
+    // Reseller users can only query usage for usernames they own.
+    if (isReseller) {
+      const allowed = await AppDataSource.getRepository(Raduserprofile)
+        .createQueryBuilder("u")
+        .select("u.username", "username")
+        .where("u.username = :username", { username })
+        .andWhere("u.ownerResellerId = :rid", { rid: resellerId })
+        .getRawOne<{ username?: string }>();
+
+      if (!allowed?.username) {
+        res.status(404).json({ success: false, message: "User not found" });
+        return;
+      }
+    }
+
+    const usageQb = AppDataSource.createQueryBuilder()
+      .from("session_usage_snapshots", "sus")
+      .select("COALESCE(SUM(sus.delta_bytes_in), 0)", "bytesIn")
+      .addSelect("COALESCE(SUM(sus.delta_bytes_out), 0)", "bytesOut")
+      .addSelect("COALESCE(SUM(sus.delta_total), 0)", "totalBytes")
+      .addSelect("COUNT(*)", "samples")
+      .addSelect("COUNT(DISTINCT sus.session_id)", "sessions")
+      .addSelect("MAX(sus.snapshot_at)", "lastSampleAt")
+      .where("sus.username = :username", { username })
+      .andWhere("sus.snapshot_at >= :windowStart", { windowStart })
+      .andWhere("sus.snapshot_at <= :windowEnd", { windowEnd });
+
+    const row = await usageQb.getRawOne<{
+      bytesIn: string;
+      bytesOut: string;
+      totalBytes: string;
+      samples: string;
+      sessions: string;
+      lastSampleAt: string | null;
+    }>();
+
+    const bytesIn = Number(row?.bytesIn ?? 0);
+    const bytesOut = Number(row?.bytesOut ?? 0);
+    const totalBytes = Number(row?.totalBytes ?? 0);
+    const samples = Number(row?.samples ?? 0);
+    const sessions = Number(row?.sessions ?? 0);
+    const totalGiB = totalBytes / (1024 * 1024 * 1024);
+
+    res.status(200).json({
+      success: true,
+      message: "Usage window fetched",
+      data: {
+        username,
+        hours,
+        windowStart: windowStart.toISOString(),
+        windowEnd: windowEnd.toISOString(),
+        bytesIn,
+        bytesOut,
+        totalBytes,
+        totalGiB: Number(totalGiB.toFixed(4)),
+        samples,
+        sessions,
+        lastSampleAt: row?.lastSampleAt ?? null,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching usage window:", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
 export const disconnectOnlineUser = async (req: Request, res: Response) => {
   try {
     const username = String(req.body?.username ?? "").trim();

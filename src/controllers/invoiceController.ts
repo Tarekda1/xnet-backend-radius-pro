@@ -13,7 +13,10 @@ import {
   getCollectedMetrics,
   getCollectorBreakdown,
   getCollectedInvoicesList,
-  unpayExternalInvoice
+  unpayExternalInvoice,
+  getExternalInvoicesAgingSummary,
+  getExternalInvoiceHistory,
+  setExternalInvoiceWorkflow
 } from "../services/invoiceService";
 import * as XLSX from "xlsx";
 import fs from "fs";
@@ -732,14 +735,83 @@ export const getExternalInvoicesHandler = async (req: Request, res: Response) =>
     const from = (req.query.from as string) || undefined;
     const to = (req.query.to as string) || undefined;
     const status = (req.query.status as string) || undefined;
+    const ageBucket = (req.query.ageBucket as string) || undefined;
+    const graceDays = Math.max(0, parseIntOrDefault(req.query.graceDays, 7));
     const sortBy = (req.query.sortBy as 'createdAt' | 'billingMonth' | 'amount') || 'createdAt';
     const sortDir = ((req.query.sortDir as string)?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC') as 'ASC' | 'DESC';
 
-    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir);
+    const result = await getAllExternalInvoices(page, limit, search, from, to, status, sortBy, sortDir, false, ageBucket, graceDays);
     sendResponse(res, true, 200, "External invoices fetched successfully", result);
   } catch (err) {
     console.error("Error fetching external invoices:", err);
     res.status(500).json({ message: "Failed to fetch external invoices" });
+  }
+};
+
+export const getExternalInvoicesAgingSummaryHandler = async (req: Request, res: Response) => {
+  try {
+    const search = (req.query.search as string) || '';
+    const from = (req.query.from as string) || undefined;
+    const to = (req.query.to as string) || undefined;
+    const status = (req.query.status as string) || undefined;
+    const graceDays = Math.max(0, parseIntOrDefault(req.query.graceDays, 7));
+
+    const result = await getExternalInvoicesAgingSummary({
+      search,
+      from,
+      to,
+      status,
+      graceDays,
+    });
+    sendResponse(res, true, 200, "External invoice aging summary fetched", result);
+  } catch (err) {
+    console.error("Error fetching external invoice aging summary:", err);
+    res.status(500).json({ message: "Failed to fetch aging summary" });
+  }
+};
+
+export const getExternalInvoiceHistoryHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId);
+    if (isNaN(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+    const limit = Math.min(500, Math.max(1, parseIntOrDefault(req.query.limit, 100)));
+    const history = await getExternalInvoiceHistory(invoiceId, limit);
+    sendResponse(res, true, 200, "External invoice history fetched", history);
+  } catch (error) {
+    console.error("Error fetching external invoice history:", error);
+    const message = (error as any)?.message || "Failed to fetch invoice history";
+    if (message === 'External invoice not found') return sendResponse(res, false, 404, message);
+    res.status(500).json({ message: "Failed to fetch invoice history" });
+  }
+};
+
+export const setExternalInvoiceWorkflowHandler = async (req: Request, res: Response) => {
+  try {
+    const invoiceId = parseInt(req.params.invoiceId, 10);
+    if (!Number.isFinite(invoiceId)) {
+      return sendResponse(res, false, 400, "Invalid invoice ID");
+    }
+
+    const stage = String(req.body?.stage || "").trim().toLowerCase();
+    const promiseDate = req.body?.promiseDate ? String(req.body.promiseDate).slice(0, 10) : null;
+    const actor = req.user?.username || "system";
+
+    const invoice = await setExternalInvoiceWorkflow({
+      invoiceId,
+      actor,
+      stage: stage as any,
+      promiseDate,
+    });
+
+    return sendResponse(res, true, 200, "External invoice workflow updated", invoice);
+  } catch (error: any) {
+    console.error("Error updating external invoice workflow:", error);
+    const message = String(error?.message || "Failed to update workflow");
+    if (message === 'External invoice not found') return sendResponse(res, false, 404, message);
+    if (message === 'Invalid workflow stage') return sendResponse(res, false, 400, message);
+    return sendResponse(res, false, 500, "Failed to update workflow");
   }
 };
 
@@ -882,6 +954,16 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
     // Optional: mark last action (best-effort; don't fail reminder if update fails)
     try {
       await repo.update({ id: invoiceId }, { lastAction: `reminded by ${req.user?.username || "system"} @ ${new Date().toISOString()}` });
+    } catch {}
+    try {
+      await invoiceEvents.emitModification({
+        invoiceId,
+        username: req.user?.username || "system",
+        action: "UPDATED",
+        timestamp: new Date(),
+        changes: { reminderSent: true },
+        data: { persistLastAction: `reminded by ${req.user?.username || "system"} @ ${new Date().toISOString()}` },
+      });
     } catch {}
 
     return sendResponse(res, true, 200, "Reminder sent", { ok: true, ...result });

@@ -25,7 +25,7 @@ invoiceEvents.on('invoice:modification', async (modification) => {
             if (invoice) {
                 invoice.modifiedBy = modification.username;
                 invoice.modifiedAt = modification.timestamp;
-                invoice.lastAction = modification.action;
+                invoice.lastAction = modification?.data?.persistLastAction || modification.action;
                 await invoiceRepo.save(invoice);
             }
         }

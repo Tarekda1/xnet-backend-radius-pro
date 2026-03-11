@@ -1,11 +1,12 @@
 // src/services/invoice.service.ts
 import { AppDataSource } from '../db/config';
-import { In } from 'typeorm';
+import { In, SelectQueryBuilder } from 'typeorm';
 import { Raduserprofile } from "../db/entities/Raduserprofile";
 import { Invoices } from "../db/entities/Invoices";
 import { startOfMonth } from "date-fns";
 import { UserDetails } from '../db/entities/UserDetails';
 import { ExternalInvoice } from '../db/entities/ExternalInvoice';
+import { ModificationLog } from '../db/entities/ModificationLog';
 import { invoiceEvents } from '../events/invoiceEvents';
 
 function isYmdOnly(value: string): boolean {
@@ -34,6 +35,53 @@ function parseRangeEnd(value: string): Date {
     // If caller passes date-only, interpret as end-of-day in server/local time (inclusive)
     if (isYmdOnly(value)) return new Date(`${value}T23:59:59.999`);
     return new Date(value);
+}
+
+type AgingBucket = 'current' | '1_30' | '31_60' | '61_90' | '90_plus';
+
+function normalizeAgeBucket(value?: string): AgingBucket | null {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return null;
+    if (raw === 'current') return 'current';
+    if (raw === '1_30' || raw === '1-30') return '1_30';
+    if (raw === '31_60' || raw === '31-60') return '31_60';
+    if (raw === '61_90' || raw === '61-90') return '61_90';
+    if (raw === '90_plus' || raw === '90+') return '90_plus';
+    return null;
+}
+
+function applyAgeBucketFilter(
+    qb: SelectQueryBuilder<ExternalInvoice>,
+    alias: string,
+    ageBucket?: string,
+    graceDays = 7
+) {
+    const bucket = normalizeAgeBucket(ageBucket);
+    if (!bucket) return;
+
+    // Aging is meaningful for open items only.
+    qb.andWhere(`${alias}.status IN (:...openStatuses)`, { openStatuses: ['unpaid', 'pending'] });
+
+    const overdueExpr = `DATEDIFF(CURDATE(), DATE_ADD(LAST_DAY(${alias}.billingMonth), INTERVAL :graceDaysAge DAY))`;
+    qb.setParameter('graceDaysAge', Math.max(0, Number(graceDays) || 0));
+
+    if (bucket === 'current') {
+        qb.andWhere(`${overdueExpr} <= 0`);
+        return;
+    }
+    if (bucket === '1_30') {
+        qb.andWhere(`${overdueExpr} BETWEEN 1 AND 30`);
+        return;
+    }
+    if (bucket === '31_60') {
+        qb.andWhere(`${overdueExpr} BETWEEN 31 AND 60`);
+        return;
+    }
+    if (bucket === '61_90') {
+        qb.andWhere(`${overdueExpr} BETWEEN 61 AND 90`);
+        return;
+    }
+    qb.andWhere(`${overdueExpr} >= 91`);
 }
 
 export const generateMonthlyInvoices = async () => {
@@ -410,7 +458,9 @@ export const getAllExternalInvoices = async (
     status?: string,
     sortBy: 'createdAt' | 'billingMonth' | 'amount' = 'createdAt',
     sortDir: 'ASC' | 'DESC' = 'DESC',
-    includeDeleted = false
+    includeDeleted = false,
+    ageBucket?: string,
+    graceDays = 7
 ) => {
     const externalInvoiceRepo = AppDataSource.getRepository(ExternalInvoice);
 
@@ -451,6 +501,7 @@ export const getAllExternalInvoices = async (
     if (status && status !== 'all') {
         qb.andWhere("externalInvoice.status = :status", { status });
     }
+    applyAgeBucketFilter(qb, 'externalInvoice', ageBucket, graceDays);
 
     // Fetch paginated results
     const [data, total] = await qb.getManyAndCount();
@@ -486,6 +537,7 @@ export const getAllExternalInvoices = async (
     if (status && status !== 'all') {
         baseQb.andWhere("externalInvoice.status = :status", { status });
     }
+    applyAgeBucketFilter(baseQb, 'externalInvoice', ageBucket, graceDays);
 
     const totalPaid = await baseQb
         .clone()
@@ -520,6 +572,214 @@ export const getAllExternalInvoices = async (
             totalAmount: parseFloat(totalAmount?.sum || "0"),
         },
     };
+};
+
+const computeOverdueDays = (billingMonth: string, graceDays: number, asOf = new Date()): number => {
+    const date = new Date(billingMonth);
+    if (Number.isNaN(date.getTime())) return 0;
+    const dueDate = new Date(date.getFullYear(), date.getMonth() + 1, 0);
+    dueDate.setDate(dueDate.getDate() + Math.max(0, graceDays));
+    dueDate.setHours(23, 59, 59, 999);
+    const diff = Math.floor((asOf.getTime() - dueDate.getTime()) / (24 * 60 * 60 * 1000));
+    return diff;
+};
+
+const getBucketKey = (overdueDays: number): AgingBucket => {
+    if (overdueDays <= 0) return 'current';
+    if (overdueDays <= 30) return '1_30';
+    if (overdueDays <= 60) return '31_60';
+    if (overdueDays <= 90) return '61_90';
+    return '90_plus';
+};
+
+export const getExternalInvoicesAgingSummary = async (params: {
+    search?: string;
+    from?: string;
+    to?: string;
+    status?: string;
+    graceDays?: number;
+}) => {
+    const { search = '', from, to, status, graceDays = 7 } = params;
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const qb = repo.createQueryBuilder('externalInvoice')
+        .where('externalInvoice.deletedAt IS NULL');
+
+    if (search) {
+        qb.andWhere(
+            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.id = :id)",
+            {
+                search: `%${search}%`,
+                id: isNaN(Number(search)) ? 0 : Number(search),
+            }
+        );
+    }
+
+    if (from && to) {
+        qb.andWhere('externalInvoice.billingMonth BETWEEN :from AND :to', { from, to });
+    } else if (from) {
+        qb.andWhere('externalInvoice.billingMonth >= :from', { from });
+    } else if (to) {
+        qb.andWhere('externalInvoice.billingMonth <= :to', { to });
+    }
+
+    if (status && status !== 'all') {
+        qb.andWhere('externalInvoice.status = :status', { status });
+    }
+
+    const rows = await qb
+        .select([
+            'externalInvoice.id',
+            'externalInvoice.username',
+            'externalInvoice.fullName',
+            'externalInvoice.amount',
+            'externalInvoice.status',
+            'externalInvoice.billingMonth',
+        ])
+        .getMany();
+
+    const openRows = rows.filter((row) => ['unpaid', 'pending'].includes(String(row.status || '').toLowerCase()));
+    const now = new Date();
+    const bucketTotals: Record<AgingBucket, { count: number; amount: number }> = {
+        current: { count: 0, amount: 0 },
+        '1_30': { count: 0, amount: 0 },
+        '31_60': { count: 0, amount: 0 },
+        '61_90': { count: 0, amount: 0 },
+        '90_plus': { count: 0, amount: 0 },
+    };
+
+    const overdueRows = openRows.map((row) => {
+        const overdueDays = computeOverdueDays(String(row.billingMonth), graceDays, now);
+        const amount = Number(row.amount || 0);
+        const bucket = getBucketKey(overdueDays);
+        bucketTotals[bucket].count += 1;
+        bucketTotals[bucket].amount += amount;
+        return {
+            id: Number(row.id),
+            username: String(row.username || ''),
+            fullName: String(row.fullName || ''),
+            overdueDays,
+            amount,
+        };
+    });
+
+    const overdueOnly = overdueRows.filter((row) => row.overdueDays > 0);
+    const openAmount = overdueRows.reduce((acc, row) => acc + row.amount, 0);
+    const overdueAmount = overdueOnly.reduce((acc, row) => acc + row.amount, 0);
+    const avgDaysOverdue = overdueOnly.length
+        ? overdueOnly.reduce((acc, row) => acc + row.overdueDays, 0) / overdueOnly.length
+        : 0;
+
+    const debtorMap = new Map<string, { username: string; fullName: string; amount: number; invoices: number; maxOverdueDays: number }>();
+    for (const row of overdueOnly) {
+        const key = `${row.username}::${row.fullName}`;
+        const prev = debtorMap.get(key) || {
+            username: row.username,
+            fullName: row.fullName,
+            amount: 0,
+            invoices: 0,
+            maxOverdueDays: 0,
+        };
+        prev.amount += row.amount;
+        prev.invoices += 1;
+        prev.maxOverdueDays = Math.max(prev.maxOverdueDays, row.overdueDays);
+        debtorMap.set(key, prev);
+    }
+
+    const topDebtors = Array.from(debtorMap.values())
+        .sort((a, b) => (b.amount - a.amount) || (b.maxOverdueDays - a.maxOverdueDays))
+        .slice(0, 10);
+
+    return {
+        asOf: now.toISOString(),
+        graceDays: Math.max(0, Number(graceDays) || 0),
+        openInvoices: openRows.length,
+        openAmount,
+        overdueInvoices: overdueOnly.length,
+        overdueAmount,
+        overdueRatePercent: openAmount > 0 ? (overdueAmount / openAmount) * 100 : 0,
+        avgDaysOverdue,
+        buckets: [
+            { key: 'current', label: 'Current', ...bucketTotals.current },
+            { key: '1_30', label: '1-30', ...bucketTotals['1_30'] },
+            { key: '31_60', label: '31-60', ...bucketTotals['31_60'] },
+            { key: '61_90', label: '61-90', ...bucketTotals['61_90'] },
+            { key: '90_plus', label: '90+', ...bucketTotals['90_plus'] },
+        ],
+        topDebtors,
+    };
+};
+
+export const getExternalInvoiceHistory = async (invoiceId: number, limit = 100) => {
+    const invoiceRepo = AppDataSource.getRepository(ExternalInvoice);
+    const logRepo = AppDataSource.getRepository(ModificationLog);
+
+    const invoice = await invoiceRepo.findOne({ where: { id: invoiceId }, withDeleted: true });
+    if (!invoice) {
+        throw new Error('External invoice not found');
+    }
+
+    const logs = await logRepo
+        .createQueryBuilder('log')
+        .leftJoin('log.invoice', 'invoice')
+        .where('invoice.id = :invoiceId', { invoiceId })
+        .orderBy('log.timestamp', 'DESC')
+        .take(Math.min(500, Math.max(1, Number(limit) || 100)))
+        .getMany();
+
+    return logs.map((log) => ({
+        id: log.id,
+        action: log.action,
+        username: log.username,
+        timestamp: log.timestamp,
+        changes: log.changes,
+    }));
+};
+
+type WorkflowStage = 'new' | 'reminded' | 'promise_to_pay' | 'escalated' | 'resolved';
+
+export const setExternalInvoiceWorkflow = async (params: {
+    invoiceId: number;
+    actor: string;
+    stage: WorkflowStage;
+    promiseDate?: string | null;
+}) => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    const invoice = await repo.findOne({ where: { id: params.invoiceId } });
+    if (!invoice) {
+        throw new Error('External invoice not found');
+    }
+
+    const allowedStages: WorkflowStage[] = ['new', 'reminded', 'promise_to_pay', 'escalated', 'resolved'];
+    if (!allowedStages.includes(params.stage)) {
+        throw new Error('Invalid workflow stage');
+    }
+
+    const promiseDate = params.promiseDate ? String(params.promiseDate).slice(0, 10) : null;
+    const now = new Date();
+    const marker =
+        params.stage === 'promise_to_pay' && promiseDate
+            ? `workflow:${params.stage}:promise:${promiseDate} by ${params.actor} @ ${now.toISOString()}`
+            : `workflow:${params.stage} by ${params.actor} @ ${now.toISOString()}`;
+
+    const previousLastAction = invoice.lastAction;
+    invoice.lastAction = marker;
+    invoice.modifiedBy = params.actor;
+    invoice.modifiedAt = now;
+
+    await repo.save(invoice);
+    await invoiceEvents.emitModification({
+        invoiceId: invoice.id || -1,
+        username: params.actor,
+        action: 'UPDATED',
+        timestamp: now,
+        changes: {
+            workflowStage: { from: previousLastAction, to: marker },
+            promiseDate: promiseDate ?? null,
+        },
+        data: { persistLastAction: marker },
+    });
+
+    return invoice;
 };
 
 export const updateExternalInvoice = async (invoiceId: number, updateData: Partial<ExternalInvoice>) => {

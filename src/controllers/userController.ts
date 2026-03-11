@@ -453,6 +453,7 @@ export const UserController = {
                     "user.id",
                     "user.username",
                     "user.profileId",
+                    "user.freenight",
                     "user.isFallback",
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
@@ -550,6 +551,7 @@ export const UserController = {
         body('password').isString().notEmpty(),
         body('profileId').isInt().notEmpty(),
         body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated"]),
+        body('freenight').optional().isBoolean(),
         body('quotaResetDay').isInt().optional(),
         body('fullName').optional().isString(),
         body('address').isString().optional(),
@@ -573,7 +575,7 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, accountStatus, quotaResetDay, fullName, address, phoneNumber, email } = req.body;
+            const { username, password, profileId, accountStatus, freenight, quotaResetDay, fullName, address, phoneNumber, email } = req.body;
             try {
                 const { isReseller, resellerId } = getResellerFilter(req);
                 const userRepository = AppDataSource.getRepository(Raduserprofile);
@@ -598,6 +600,7 @@ export const UserController = {
                 const user = new Raduserprofile();
                 user.username = username;
                 user.profileId = profileId;
+                user.freenight = Boolean(freenight);
                 user.isFallback = false;
                 user.isMonthlyExceeded = false;
                 user.quotaResetDay = quotaResetDay || new Date().getDate();
@@ -625,6 +628,7 @@ export const UserController = {
                     meta: {
                         profileId,
                         accountStatus: user.accountStatus,
+                        freenight: user.freenight,
                         quotaResetDay: user.quotaResetDay,
                         reseller: isReseller ? { resellerId } : null,
                     },
@@ -641,6 +645,7 @@ export const UserController = {
         body('password').optional().isString().notEmpty(), // Password is optional
         body('profileId').optional().isInt(), // Profile ID is optional
         body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated"]), // Validate account status
+        body('freenight').optional().isBoolean(), // Free-night toggle is optional
         body('fullName').optional().isString(), // Full name is optional
         body('address').optional().isString(), // Address is optional
         body('phoneNumber').optional().isString(), // Phone number is optional
@@ -664,7 +669,7 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, accountStatus, fullName, address, phoneNumber, email } = req.body;
+            const { username, password, profileId, accountStatus, freenight, fullName, address, phoneNumber, email } = req.body;
             // Optional: force disconnect so user re-auths (drops session).
             // This is NOT the default because CoA is usually sufficient and avoids disruptions.
             const forceDisconnect =
@@ -686,6 +691,7 @@ export const UserController = {
                 }
                 const oldProfileId = user.profileId;
                 const oldAccountStatus = user.accountStatus;
+                const oldFreenight = user.freenight;
 
                 // 🔹 Update password if provided
                 if (password) {
@@ -707,6 +713,7 @@ export const UserController = {
                 // 🔹 Update profile details if provided
                 if (profileId) user.profileId = profileId;
                 if (accountStatus) user.accountStatus = accountStatus;
+                if (freenight !== undefined) user.freenight = Boolean(freenight);
 
                 await userRepository.save(user); // Save updates
                 if (typeof profileId === "number" && Number.isFinite(profileId) && profileId > 0 && profileId !== oldProfileId) {
@@ -803,6 +810,7 @@ export const UserController = {
                         changed: {
                             profileId: typeof profileId === "number" && Number.isFinite(profileId) ? { from: oldProfileId, to: profileId } : null,
                             accountStatus: accountStatus ? { from: oldAccountStatus, to: accountStatus } : null,
+                            freenight: freenight !== undefined ? { from: oldFreenight, to: Boolean(freenight) } : null,
                             userDetails: {
                                 fullName: fullName !== undefined ? true : null,
                                 address: address !== undefined ? true : null,
@@ -1237,6 +1245,7 @@ export const UserController = {
                     "user.id",
                     "user.username",
                     "user.profileId",
+                    "user.freenight",
                     "user.isFallback",
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
@@ -1801,6 +1810,7 @@ export const UserController = {
                 password: String(u?.password ?? "").trim(),
                 profileId: Number(u?.profileId),
                 accountStatus: String(u?.accountStatus ?? "active"),
+                freenight: u?.freenight === undefined ? undefined : Boolean(u.freenight),
                 quotaResetDay: u?.quotaResetDay === undefined || u?.quotaResetDay === null ? null : Number(u.quotaResetDay),
                 fullName: u?.fullName === undefined ? undefined : String(u.fullName ?? "").trim(),
                 address: u?.address === undefined ? undefined : String(u.address ?? "").trim(),
@@ -1913,6 +1923,7 @@ export const UserController = {
                         const user = new Raduserprofile();
                         user.username = u.username;
                         user.profileId = u.profileId;
+                        user.freenight = u.freenight === undefined ? false : Boolean(u.freenight);
                         user.isFallback = false;
                         user.isMonthlyExceeded = false;
                         user.quotaResetDay = u.quotaResetDay || new Date().getDate();

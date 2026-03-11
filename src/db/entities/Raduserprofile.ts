@@ -23,6 +23,14 @@ export class Raduserprofile {
   profileId: number;
 
   @Column("tinyint", {
+    name: "freenight",
+    nullable: true,
+    width: 1,
+    default: () => "'0'",
+  })
+  freenight: boolean | null;
+
+  @Column("tinyint", {
     name: "is_fallback",
     nullable: true,
     width: 1,
