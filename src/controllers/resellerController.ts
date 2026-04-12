@@ -216,7 +216,7 @@ export const resellerUsersCreate = [
   async (req: Request, res: Response) => {
     try {
       const resellerId = requireResellerContext(req);
-      const { username, password, profileId, fullName, email, phoneNumber, address } = req.body ?? {};
+      const { username, password, profileId, fullName, email, phoneNumber, address, expiresAt, expiryFramedIp } = req.body ?? {};
       if (typeof username !== "string" || username.trim() === "") return send(res, false, 400, "username is required");
       if (typeof password !== "string" || password.trim() === "") return send(res, false, 400, "password is required");
       const pid = Number(profileId);
@@ -261,6 +261,12 @@ export const resellerUsersCreate = [
         quotaResetDay: new Date().getDate(),
         accountStatus: "active",
         ownerResellerId: resellerId,
+        ...(typeof expiresAt === "string" &&
+        expiresAt.trim() &&
+        !Number.isNaN(new Date(expiresAt).getTime()) && { expiresAt: new Date(expiresAt) }),
+        ...(typeof expiryFramedIp === "string" && expiryFramedIp.trim() && {
+          expiryFramedIp: expiryFramedIp.trim().slice(0, 45),
+        }),
       } as any);
       const createdUser = await userRepo.save(user as any);
 

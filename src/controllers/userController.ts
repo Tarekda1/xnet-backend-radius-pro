@@ -153,6 +153,18 @@ const deleteCacheKeys = async () => {
     }
 };
 
+function parseExpiresAtField(input: unknown): Date | null {
+  if (input === undefined || input === null || input === "") return null;
+  const d = new Date(String(input));
+  if (Number.isNaN(d.getTime())) throw new Error("Invalid expiresAt");
+  return d;
+}
+
+function parseExpiryFramedIpField(input: unknown): string | null {
+  if (input === undefined || input === null || input === "") return null;
+  return String(input).trim().slice(0, 45);
+}
+
 function formatUsersWithStatus(entities: any, raw: any) {
     return entities.map((user: any, index: number) => ({
         ...user,
@@ -458,6 +470,8 @@ export const UserController = {
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
                     "user.accountStatus",
+                    "user.expiresAt",
+                    "user.expiryFramedIp",
                     "profile.id",
                     "profile.profileName",
                     "profile.dailyQuota",
@@ -550,7 +564,9 @@ export const UserController = {
         body('username').isString().notEmpty(),
         body('password').isString().notEmpty(),
         body('profileId').isInt().notEmpty(),
-        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated"]),
+        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated", "expired"]),
+        body('expiresAt').optional().isString(),
+        body('expiryFramedIp').optional().isString(),
         body('freenight').optional().isBoolean(),
         body('quotaResetDay').isInt().optional(),
         body('fullName').optional().isString(),
@@ -575,7 +591,7 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, accountStatus, freenight, quotaResetDay, fullName, address, phoneNumber, email } = req.body;
+            const { username, password, profileId, accountStatus, freenight, quotaResetDay, fullName, address, phoneNumber, email, expiresAt, expiryFramedIp } = req.body;
             try {
                 const { isReseller, resellerId } = getResellerFilter(req);
                 const userRepository = AppDataSource.getRepository(Raduserprofile);
@@ -605,6 +621,16 @@ export const UserController = {
                 user.isMonthlyExceeded = false;
                 user.quotaResetDay = quotaResetDay || new Date().getDate();
                 user.accountStatus = (accountStatus || 'active') as any;
+                if (expiresAt !== undefined && expiresAt !== null && expiresAt !== "") {
+                    try {
+                        user.expiresAt = parseExpiresAtField(expiresAt);
+                    } catch {
+                        return sendResponse(res, false, 400, "Invalid expiresAt (use ISO 8601 datetime)");
+                    }
+                }
+                if (expiryFramedIp !== undefined && expiryFramedIp !== null && expiryFramedIp !== "") {
+                    user.expiryFramedIp = parseExpiryFramedIpField(expiryFramedIp);
+                }
                 if (isReseller && resellerId) {
                     (user as any).ownerResellerId = resellerId;
                 }
@@ -644,7 +670,9 @@ export const UserController = {
         body('username').isString().notEmpty(), // Username is required
         body('password').optional().isString().notEmpty(), // Password is optional
         body('profileId').optional().isInt(), // Profile ID is optional
-        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated"]), // Validate account status
+        body('accountStatus').optional().isString().isIn(["active", "suspended", "terminated", "expired"]), // Validate account status
+        body("expiresAt").optional(),
+        body("expiryFramedIp").optional(),
         body('freenight').optional().isBoolean(), // Free-night toggle is optional
         body('fullName').optional().isString(), // Full name is optional
         body('address').optional().isString(), // Address is optional
@@ -669,7 +697,7 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, accountStatus, freenight, fullName, address, phoneNumber, email } = req.body;
+            const { username, password, profileId, accountStatus, freenight, fullName, address, phoneNumber, email, expiresAt, expiryFramedIp } = req.body;
             // Optional: force disconnect so user re-auths (drops session).
             // This is NOT the default because CoA is usually sufficient and avoids disruptions.
             const forceDisconnect =
@@ -714,6 +742,23 @@ export const UserController = {
                 if (profileId) user.profileId = profileId;
                 if (accountStatus) user.accountStatus = accountStatus;
                 if (freenight !== undefined) user.freenight = Boolean(freenight);
+                if (expiresAt !== undefined) {
+                    if (expiresAt === null || expiresAt === "") {
+                        user.expiresAt = null;
+                    } else {
+                        try {
+                            user.expiresAt = parseExpiresAtField(expiresAt);
+                        } catch {
+                            return sendResponse(res, false, 400, "Invalid expiresAt (use ISO 8601 datetime)");
+                        }
+                    }
+                }
+                if (expiryFramedIp !== undefined) {
+                    user.expiryFramedIp =
+                        expiryFramedIp === null || expiryFramedIp === ""
+                            ? null
+                            : parseExpiryFramedIpField(expiryFramedIp);
+                }
 
                 await userRepository.save(user); // Save updates
                 if (typeof profileId === "number" && Number.isFinite(profileId) && profileId > 0 && profileId !== oldProfileId) {
@@ -1250,6 +1295,8 @@ export const UserController = {
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
                     "user.accountStatus",
+                    "user.expiresAt",
+                    "user.expiryFramedIp",
                     "user.ownerResellerId",
                     "profile.id",
                     "profile.profileName",
@@ -1515,13 +1562,13 @@ export const UserController = {
             const accountStatus = String(req.body?.accountStatus ?? "").trim();
             const dryRun = Boolean(req.body?.dryRun);
 
-            const allowed = new Set(["active", "suspended", "terminated"]);
+            const allowed = new Set(["active", "suspended", "terminated", "expired"]);
 
             if (usernames.length === 0) {
                 return sendResponse(res, false, 400, "usernames[] is required", { errors: ["usernames is required"] });
             }
             if (!allowed.has(accountStatus)) {
-                return sendResponse(res, false, 400, "Invalid accountStatus", { errors: ["accountStatus must be one of: active, suspended, terminated"] });
+                return sendResponse(res, false, 400, "Invalid accountStatus", { errors: ["accountStatus must be one of: active, suspended, terminated, expired"] });
             }
             if (usernames.length > 500) {
                 return sendResponse(res, false, 400, "Too many usernames", { errors: ["Max 500 usernames per request"] });
@@ -1816,6 +1863,8 @@ export const UserController = {
                 address: u?.address === undefined ? undefined : String(u.address ?? "").trim(),
                 phoneNumber: u?.phoneNumber === undefined ? undefined : String(u.phoneNumber ?? "").trim(),
                 email: u?.email === undefined ? undefined : String(u.email ?? "").trim(),
+                expiresAt: u?.expiresAt === undefined ? undefined : u.expiresAt,
+                expiryFramedIp: u?.expiryFramedIp === undefined ? undefined : u.expiryFramedIp,
             }));
 
             const seen = new Set<string>();
@@ -1840,9 +1889,17 @@ export const UserController = {
                     results.push({ username: u.username, ok: false, error: "profileId must be a positive number" });
                     continue;
                 }
-                if (!["active", "suspended", "terminated"].includes(u.accountStatus)) {
-                    results.push({ username: u.username, ok: false, error: "accountStatus must be active|suspended|terminated" });
+                if (!["active", "suspended", "terminated", "expired"].includes(u.accountStatus)) {
+                    results.push({ username: u.username, ok: false, error: "accountStatus must be active|suspended|terminated|expired" });
                     continue;
+                }
+                if (u.expiresAt !== undefined && u.expiresAt !== null && u.expiresAt !== "") {
+                    try {
+                        parseExpiresAtField(u.expiresAt);
+                    } catch {
+                        results.push({ username: u.username, ok: false, error: "invalid expiresAt" });
+                        continue;
+                    }
                 }
                 if (u.quotaResetDay !== null) {
                     if (!Number.isFinite(u.quotaResetDay) || u.quotaResetDay < 1 || u.quotaResetDay > 31) {
@@ -1928,6 +1985,12 @@ export const UserController = {
                         user.isMonthlyExceeded = false;
                         user.quotaResetDay = u.quotaResetDay || new Date().getDate();
                         user.accountStatus = u.accountStatus as any;
+                        if (u.expiresAt !== undefined && u.expiresAt !== null && u.expiresAt !== "") {
+                            user.expiresAt = parseExpiresAtField(u.expiresAt);
+                        }
+                        if (u.expiryFramedIp !== undefined && u.expiryFramedIp !== null && u.expiryFramedIp !== "") {
+                            user.expiryFramedIp = parseExpiryFramedIpField(u.expiryFramedIp);
+                        }
                         if (isReseller && resellerId) {
                             (user as any).ownerResellerId = resellerId;
                         }

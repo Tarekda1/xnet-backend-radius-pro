@@ -61,6 +61,14 @@ export class Raduserprofile {
   })
   accountStatus: string | null;
 
+  /** When set and in the past (with status still active), RADIUS flips user to `expired` and applies walled-garden replies. */
+  @Column("datetime", { name: "expires_at", nullable: true })
+  expiresAt: Date | null;
+
+  /** Optional per-user framed IP for expired sessions; falls back to EXPIRY_FRAMED_IP on the RADIUS server. */
+  @Column("varchar", { name: "expiry_framed_ip", nullable: true, length: 45 })
+  expiryFramedIp: string | null;
+
   @Column("int", { name: "owner_reseller_id", nullable: true })
   ownerResellerId: number | null;
 
