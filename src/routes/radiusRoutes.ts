@@ -21,6 +21,7 @@ router.put('/users/resetMonthlyQuota/:username', authorizeAnyPermissions('users.
 router.put('/users/:username', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.updateUser);
 router.post('/users/resetAddress/:username', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.resetMacAddress);
 router.post('/users/:username/apply-rate-limit', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.applyProfileRateLimitNow);
+router.post('/users/:username/renew', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.renewSubscription);
 router.post('/users/bulk/assign-profile', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.bulkAssignProfile);
 router.post('/users/bulk/set-status', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.bulkSetStatus);
 router.post('/users/bulk/reset-mac', authorizeAnyPermissions('users.view', 'reseller.users.manage'), UserController.bulkResetMac);

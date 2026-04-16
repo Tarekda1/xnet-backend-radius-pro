@@ -26,7 +26,9 @@ services:
 
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672}
       # Better logs for Loki (JSON + requestId fields)
-      LOG_FORMAT: ${LOG_FORMAT:-json}
+      EXPIRY_DISCONNECT_CRON: ${EXPIRY_DISCONNECT_CRON:-*/5 * * * *}
+      EXPIRY_DISCONNECT_BATCH: ${EXPIRY_DISCONNECT_BATCH:-100}
+      EXPIRY_DISCONNECT_RUN_ON_STARTUP: ${EXPIRY_DISCONNECT_RUN_ON_STARTUP:-1}
     # Do NOT mount the source code in prod compose.
     # Mount only runtime data directories if needed.
     volumes:

@@ -165,6 +165,15 @@ function parseExpiryFramedIpField(input: unknown): string | null {
   return String(input).trim().slice(0, 45);
 }
 
+/** Extend `from` by whole months (handles month-length edges e.g. Jan 31 +1 month). */
+function addCalendarMonths(from: Date, months: number): Date {
+    const d = new Date(from.getTime());
+    const day = d.getDate();
+    d.setMonth(d.getMonth() + months);
+    if (d.getDate() !== day) d.setDate(0);
+    return d;
+}
+
 function formatUsersWithStatus(entities: any, raw: any) {
     return entities.map((user: any, index: number) => ({
         ...user,
@@ -760,7 +769,25 @@ export const UserController = {
                             : parseExpiryFramedIpField(expiryFramedIp);
                 }
 
+                // Match FreeRADIUS: past expires_at + still active => expired (do not touch suspended/terminated).
+                if (
+                    user.expiresAt !== null &&
+                    user.expiresAt.getTime() <= Date.now() &&
+                    String(user.accountStatus ?? "").trim() === "active"
+                ) {
+                    user.accountStatus = "expired";
+                }
+
                 await userRepository.save(user); // Save updates
+
+                if (expiresAt !== undefined && user.expiresAt !== null && user.expiresAt.getTime() <= Date.now()) {
+                    void UserController.disconnectWithOpenSessionLookup(username).then((r) => {
+                        if (!r.ok) {
+                            console.warn(`[expiry-disconnect] after user update failed for ${username}:`, r.error);
+                        }
+                    });
+                }
+
                 if (typeof profileId === "number" && Number.isFinite(profileId) && profileId > 0 && profileId !== oldProfileId) {
                     await upsertUserDefaultProfileBestEffort(username, profileId);
                 }
@@ -1117,6 +1144,36 @@ export const UserController = {
         }
     },
 
+    /** Latest open radacct row → NAS secret → disconnect (MikroTik API first, then Disconnect-Request). */
+    disconnectWithOpenSessionLookup: async (
+        username: string
+    ): Promise<
+        | { ok: true; method: "mikrotik-api"; result: { pppRemoved: number; hotspotRemoved: number } }
+        | { ok: true; method: "radclient"; stdout: string; stderr: string }
+        | { ok: false; method: "none" | "radclient"; error: string; stdout?: string; stderr?: string }
+    > => {
+        const usernameTrim = String(username || "").trim();
+        if (!usernameTrim) {
+            return { ok: false, method: "none", error: "Username is required" };
+        }
+        const raRepo = AppDataSource.getRepository(Radacct);
+        const active = await raRepo
+            .createQueryBuilder("ra")
+            .select("ra.nasipaddress", "nasipaddress")
+            .where("ra.username = :username", { username: usernameTrim })
+            .andWhere("ra.acctstoptime IS NULL")
+            .orderBy("ra.acctstarttime", "DESC")
+            .limit(1)
+            .getRawOne<{ nasipaddress?: string }>();
+        const nasIp = String(active?.nasipaddress ?? "").trim() || undefined;
+        let secret: string | undefined;
+        if (nasIp) {
+            const nas = await AppDataSource.getRepository(Nas).findOne({ where: { nasname: nasIp } as any });
+            secret = nas?.secret;
+        }
+        return UserController.disconnectUser(usernameTrim, nasIp, secret);
+    },
+
     // Apply current profile speed to an active session via MikroTik CoA (no disconnect).
     // This is the "Option A" fix for users stuck with a previous fallback dynamic queue rate.
     applyProfileRateLimit: async (
@@ -1200,6 +1257,88 @@ export const UserController = {
             return sendResponse(res, false, 500, "Error applying rate-limit", { error: e?.message || String(e) });
         }
     },
+
+    renewSubscription: [
+        body("months").optional().isInt({ min: 1, max: 36 }),
+        async (req: Request, res: Response) => {
+            const errors = validationResult(req);
+            if (!errors.isEmpty()) {
+                return sendResponse(res, false, 400, "Validation errors", errors.array());
+            }
+            const username = String(req.params.username || "").trim();
+            if (!username) return sendResponse(res, false, 400, "Username is required");
+
+            const monthsRaw = (req.body as any)?.months;
+            const months =
+                monthsRaw === undefined || monthsRaw === null || monthsRaw === ""
+                    ? 1
+                    : parseInt(String(monthsRaw), 10);
+            if (!Number.isFinite(months) || months < 1 || months > 36) {
+                return sendResponse(res, false, 400, "months must be 1–36");
+            }
+
+            try {
+                const { isReseller, resellerId } = getResellerFilter(req);
+                const userRepository = AppDataSource.getRepository(Raduserprofile);
+                const user = await userRepository.findOne({ where: { username } });
+                if (!user) {
+                    return sendResponse(res, false, 404, "User not found");
+                }
+                if (isReseller && resellerId && (user as any).ownerResellerId !== resellerId) {
+                    return sendResponse(res, false, 404, "User not found");
+                }
+
+                const st = String(user.accountStatus ?? "").trim();
+                if (st === "suspended" || st === "terminated") {
+                    return sendResponse(res, false, 400, "Cannot renew: account is suspended or terminated");
+                }
+
+                const now = new Date();
+                const pastExpiry = user.expiresAt !== null && user.expiresAt.getTime() < now.getTime();
+                const isExpiredStatus = st === "expired";
+                if (!isExpiredStatus && !pastExpiry) {
+                    return sendResponse(
+                        res,
+                        false,
+                        400,
+                        "Subscription is not expired; extend expiry from the user form if needed"
+                    );
+                }
+
+                const currentEnd = user.expiresAt ? new Date(user.expiresAt.getTime()) : null;
+                const base =
+                    currentEnd && currentEnd.getTime() > now.getTime() ? currentEnd : now;
+                user.expiresAt = addCalendarMonths(base, months);
+                user.accountStatus = "active";
+
+                await userRepository.save(user);
+                await deleteCacheKeys();
+
+                void UserController.disconnectWithOpenSessionLookup(username).then((r) => {
+                    if (!r.ok) {
+                        console.warn(`[renew] disconnect after renew failed for ${username}:`, r.error);
+                    }
+                });
+
+                await writeAuditLog({
+                    req,
+                    action: "users.renew",
+                    targetUsernames: [username],
+                    meta: { months, newExpiresAt: user.expiresAt?.toISOString?.() ?? user.expiresAt },
+                });
+
+                return sendResponse(res, true, 200, "Subscription renewed", {
+                    username,
+                    expiresAt: user.expiresAt,
+                    accountStatus: user.accountStatus,
+                });
+            } catch (e: any) {
+                console.error("renewSubscription failed:", e);
+                return sendResponse(res, false, 500, "Error renewing subscription", { error: e?.message || String(e) });
+            }
+        },
+    ],
+
     searchUsers: async (req: Request, res: Response) => {
         try {
             const { query } = req.query;

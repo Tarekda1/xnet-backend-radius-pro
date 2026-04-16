@@ -44,6 +44,7 @@ import { redisClient } from './redisClient';
 import { AppDataSource } from './db/config';
 import { metricsMiddleware, register, setWebsocketClients } from './metrics/metrics';
 import { startBackupScheduler } from "./backups/scheduler";
+import { runExpirySessionDisconnectJob } from "./jobs/expirySessionDisconnectJob";
 
 dotenv.config();
 
@@ -228,6 +229,9 @@ if (dunningTask) {
   console.log(`[dunning] scheduler enabled: ${dunningCronExpr}`);
 }
 
+/** Set after DB init — expiry job must not run before AppDataSource.initialize() completes. */
+let expiryDisconnectTask: ReturnType<typeof cron.schedule> | null = null;
+
 // RADIUS server setup
 const radiusServer = dgram.createSocket('udp4');
 
@@ -320,6 +324,26 @@ startConsumer().catch((err) => console.error('Consumer error:', err));
 initializeDB().then(() => {
     // Start scheduled backup jobs (if env cron vars are set)
     startBackupScheduler(app);
+
+    const expiryDisconnectCronExpr = String(process.env.EXPIRY_DISCONNECT_CRON ?? "").trim();
+    if (expiryDisconnectCronExpr) {
+      expiryDisconnectTask = cron.schedule(expiryDisconnectCronExpr, async () => {
+        try {
+          await runExpirySessionDisconnectJob();
+        } catch (e) {
+          console.error("[expiry-disconnect] run failed", e);
+        }
+      });
+      console.log(`[expiry-disconnect] scheduler enabled: ${expiryDisconnectCronExpr}`);
+    }
+
+    const runOnStart = String(process.env.EXPIRY_DISCONNECT_RUN_ON_STARTUP ?? "").trim().toLowerCase();
+    if (runOnStart === "1" || runOnStart === "true") {
+      setTimeout(() => {
+        runExpirySessionDisconnectJob().catch((e) => console.error("[expiry-disconnect] startup run failed", e));
+      }, 5000);
+    }
+
     server.listen(process.env.PORT || 3000, () => {
         console.log(`Server is running on http://localhost:${process.env.PORT || 3000}`);
     });
@@ -339,6 +363,9 @@ async function shutdown(signal: string) {
     } catch {}
     try {
       dunningTask?.stop();
+    } catch {}
+    try {
+      expiryDisconnectTask?.stop();
     } catch {}
 
     // Stop accepting new HTTP connections
