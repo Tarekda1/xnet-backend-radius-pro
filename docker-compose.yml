@@ -4,7 +4,7 @@ services:
     container_name: xnet-backend
     restart: always
     ports:
-      - "3000:3000"
+      - "${APP_HOST_PORT:-3000}:3000"
     stop_grace_period: 30s
     env_file:
       - .env
@@ -150,8 +150,9 @@ services:
     volumes:
       - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
       - loki_data:/loki
+    # Host 3100 is often in Windows Hyper-V / excludedportrange → "access ... forbidden". Use 13100 on host, Loki still 3100 in container.
     ports:
-      - "3100:3100"
+      - "${LOKI_HOST_PORT:-13100}:3100"
     networks:
       - backend_network
 
@@ -246,7 +247,7 @@ services:
       - grafana_data:/var/lib/grafana
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
-      - "3001:3000"
+      - "${GRAFANA_HOST_PORT:-13001}:3000"
     networks:
       - backend_network
 
