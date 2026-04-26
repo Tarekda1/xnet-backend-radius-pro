@@ -1,5 +1,6 @@
-import { Column, Entity, PrimaryGeneratedColumn } from "typeorm";
+import { Column, Entity, Index, PrimaryGeneratedColumn } from "typeorm";
 
+@Index("idx_connection_logs_timestamp_status", ["timestamp", "status"])
 @Entity("connection_logs", { schema: "radius" })
 export class ConnectionLogs {
   @PrimaryGeneratedColumn({ type: "int", name: "id" })

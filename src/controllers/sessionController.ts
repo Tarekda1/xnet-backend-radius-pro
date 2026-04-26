@@ -638,16 +638,19 @@ export const getNocSnapshot = async (req: Request, res: Response) => {
     const now = new Date();
     const start24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-    const trendRows = await AppDataSource.getRepository(ConnectionLogs)
-      .createQueryBuilder("cl")
-      .select("DATE_FORMAT(cl.timestamp, '%Y-%m-%d %H:00:00')", "bucket")
-      .addSelect("COALESCE(SUM(cl.status = 'attempt'), 0)", "attempts")
-      .addSelect("COALESCE(SUM(cl.status = 'rejected'), 0)", "rejected")
-      .where("cl.timestamp >= :start24h", { start24h })
-      .andWhere("cl.timestamp <= :now", { now })
-      .groupBy("bucket")
-      .orderBy("bucket", "ASC")
-      .getRawMany<{ bucket: string; attempts: string; rejected: string }>();
+    const trendRows = await AppDataSource.query(
+      `
+        SELECT
+          DATE_FORMAT(bucket, '%Y-%m-%d %H:00:00') AS bucket,
+          attempts,
+          rejected
+        FROM connection_log_hourly_stats
+        WHERE bucket >= ?
+          AND bucket <= ?
+        ORDER BY bucket ASC
+      `,
+      [start24h, now]
+    ) as Array<{ bucket: string; attempts: string; rejected: string }>;
 
     const authRejectTrend = trendRows.map((row) => {
       const attempts = Number(row?.attempts ?? 0);

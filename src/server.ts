@@ -45,6 +45,7 @@ import { AppDataSource } from './db/config';
 import { metricsMiddleware, register, setWebsocketClients } from './metrics/metrics';
 import { startBackupScheduler } from "./backups/scheduler";
 import { runExpirySessionDisconnectJob } from "./jobs/expirySessionDisconnectJob";
+import { startConnectionLogsMaintenanceScheduler } from "./jobs/connectionLogsMaintenance";
 
 dotenv.config();
 
@@ -324,6 +325,7 @@ startConsumer().catch((err) => console.error('Consumer error:', err));
 initializeDB().then(() => {
     // Start scheduled backup jobs (if env cron vars are set)
     startBackupScheduler(app);
+    startConnectionLogsMaintenanceScheduler();
 
     const expiryDisconnectCronExpr = String(process.env.EXPIRY_DISCONNECT_CRON ?? "").trim();
     if (expiryDisconnectCronExpr) {
