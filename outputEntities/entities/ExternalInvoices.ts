@@ -30,6 +30,9 @@ export class ExternalInvoices {
   @Column("date", { name: "billingMonth" })
   billingMonth: string;
 
+  @Column("date", { name: "payDueDate", nullable: true })
+  payDueDate: string | null;
+
   @Column("timestamp", {
     name: "createdAt",
     default: () => "CURRENT_TIMESTAMP",

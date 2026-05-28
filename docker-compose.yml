@@ -156,9 +156,9 @@ services:
     volumes:
       - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
       - loki_data:/loki
-    # Host 3100 is often in Windows Hyper-V / excludedportrange → "access ... forbidden". Use 13100 on host, Loki still 3100 in container.
+    # Host 3100 conflicts with excludedportrange on some Windows setups. Prefer LOKI_HOST_PORT outside ~12k–135xx (Hyper-V).
     ports:
-      - "${LOKI_HOST_PORT:-13100}:3100"
+      - "${LOKI_HOST_PORT:-23100}:3100"
     networks:
       - backend_network
 

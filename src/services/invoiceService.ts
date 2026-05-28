@@ -380,7 +380,27 @@ function mergeExternalInvoices(
         const sourceItem = sourceMap.get(item.id);
 
         if (sourceItem) {
-            // Merge: override identity fields from source
+            // Merge: override identity fields from source; prefer non-empty address from the import row
+            const incomingAddr = item.address;
+            const trimmedIncoming =
+                incomingAddr !== undefined && incomingAddr !== null
+                    ? String(incomingAddr).trim()
+                    : "";
+            const mergedAddress =
+                trimmedIncoming.length > 0 ? trimmedIncoming : sourceItem.address ?? null;
+
+            const incomingDue = item.payDueDate;
+            let mergedPayDue: string | null = sourceItem.payDueDate ?? null;
+            if (incomingDue !== undefined && incomingDue !== null && String(incomingDue).trim() !== '') {
+                const rawDue = incomingDue as string | Date;
+                const asDate = rawDue instanceof Date ? rawDue : new Date(String(rawDue));
+                if (!isNaN(asDate.getTime())) {
+                    mergedPayDue = asDate.toISOString().slice(0, 10);
+                } else {
+                    mergedPayDue = String(incomingDue).trim().slice(0, 10);
+                }
+            }
+
             return {
                 ...item,
                 username: sourceItem.username,
@@ -388,7 +408,8 @@ function mergeExternalInvoices(
                 email: sourceItem.email || "",
                 // Do NOT inject placeholder phone numbers; keep empty so reminders can fail loudly.
                 phoneNumber: sourceItem.phoneNumber || "",
-                address: sourceItem.address,
+                address: mergedAddress,
+                payDueDate: mergedPayDue,
                 billingMonth,
                 provider: sourceItem.provider,
             };
@@ -477,7 +498,7 @@ export const getAllExternalInvoices = async (
     // Search conditions
     if (search) {
         qb.andWhere(
-            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.id = :id)",
+            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.address LIKE :search OR externalInvoice.id = :id)",
             {
                 search: `%${search}%`,
                 id: isNaN(Number(search)) ? 0 : Number(search),
@@ -515,7 +536,7 @@ export const getAllExternalInvoices = async (
 
     if (search) {
         baseQb.andWhere(
-            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.id = :id)",
+            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.address LIKE :search OR externalInvoice.id = :id)",
             {
                 search: `%${search}%`,
                 id: isNaN(Number(search)) ? 0 : Number(search),
@@ -606,7 +627,7 @@ export const getExternalInvoicesAgingSummary = async (params: {
 
     if (search) {
         qb.andWhere(
-            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.id = :id)",
+            "(externalInvoice.username LIKE :search OR externalInvoice.fullName LIKE :search OR externalInvoice.address LIKE :search OR externalInvoice.id = :id)",
             {
                 search: `%${search}%`,
                 id: isNaN(Number(search)) ? 0 : Number(search),
@@ -707,6 +728,19 @@ export const getExternalInvoicesAgingSummary = async (params: {
         ],
         topDebtors,
     };
+};
+
+/** Open external invoices that have a payment target date set (for tracker + reminders). */
+export const getExternalInvoicesPaymentDueTracker = async (): Promise<ExternalInvoice[]> => {
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+    return repo
+        .createQueryBuilder('e')
+        .where('e.deletedAt IS NULL')
+        .andWhere('e.payDueDate IS NOT NULL')
+        .andWhere("e.status IN (:...st)", { st: ['unpaid', 'pending'] })
+        .orderBy('e.payDueDate', 'ASC')
+        .addOrderBy('e.id', 'ASC')
+        .getMany();
 };
 
 export const getExternalInvoiceHistory = async (invoiceId: number, limit = 100) => {

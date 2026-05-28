@@ -16,7 +16,8 @@ import {
   unpayExternalInvoice,
   getExternalInvoicesAgingSummary,
   getExternalInvoiceHistory,
-  setExternalInvoiceWorkflow
+  setExternalInvoiceWorkflow,
+  getExternalInvoicesPaymentDueTracker,
 } from "../services/invoiceService";
 import * as XLSX from "xlsx";
 import fs from "fs";
@@ -636,6 +637,41 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const raw = XLSX.utils.sheet_to_json(sheet);
 
+    const normalizeCell = (v: unknown): string | null => {
+      if (v === undefined || v === null) return null;
+      const s = String(v).trim();
+      return s.length ? s : null;
+    };
+
+    const pickRowAddress = (row: Record<string, unknown>): string | null =>
+      normalizeCell(row.address) ??
+      normalizeCell(row.Address) ??
+      normalizeCell(row.ADDRESS) ??
+      normalizeCell((row as any)["Address Line 1"]) ??
+      null;
+
+    const parsePayDueFromRow = (row: Record<string, unknown>): string | null => {
+      const raw =
+        row.payDueDate ??
+        row.paydate ??
+        row.PayDate ??
+        row.pay_date ??
+        (row as { payDue?: unknown }).payDue ??
+        (row as { "Pay Due"?: unknown })["Pay Due"];
+      if (raw === undefined || raw === null || raw === "") return null;
+      if (typeof raw === "number" && raw > 20000 && raw < 100000) {
+        const ms = Math.round((raw - 25569) * 86400 * 1000);
+        const d = new Date(ms);
+        if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+      }
+      if (raw instanceof Date && !isNaN(raw.getTime())) {
+        return raw.toISOString().slice(0, 10);
+      }
+      const d = new Date(String(raw));
+      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+      return null;
+    };
+
     // Optional: validate/transform
     const invoices = raw.map((row: any) => {
       console.log(`row: ${JSON.stringify(row)}`);
@@ -665,7 +701,8 @@ export const uploadExternalInvoiceFile = async (req: Request, res: Response) => 
         email: row.email,
         provider: row.provider,
         phoneNumber: row.phoneNumber,
-        address: row.address,
+        address: pickRowAddress(row),
+        payDueDate: parsePayDueFromRow(row),
         billingMonth: billingDate,
         amount: parseFloat(row.amount || 30),
         status: row.status || "pending",
@@ -767,6 +804,16 @@ export const getExternalInvoicesAgingSummaryHandler = async (req: Request, res: 
   } catch (err) {
     console.error("Error fetching external invoice aging summary:", err);
     res.status(500).json({ message: "Failed to fetch aging summary" });
+  }
+};
+
+export const getExternalInvoicesPaymentDueHandler = async (req: Request, res: Response) => {
+  try {
+    const rows = await getExternalInvoicesPaymentDueTracker();
+    sendResponse(res, true, 200, "Payment due tracker rows fetched", rows);
+  } catch (err) {
+    console.error("Error fetching payment due external invoices:", err);
+    res.status(500).json({ message: "Failed to fetch payment due invoices" });
   }
 };
 

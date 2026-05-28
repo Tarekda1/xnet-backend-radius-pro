@@ -30,6 +30,10 @@ export class ExternalInvoice {
   @Column("date", { name: "billingMonth" })
   billingMonth: string;
 
+  /** Target date when payment should be received (editable; used for reminders / tracker). */
+  @Column("date", { name: "payDueDate", nullable: true })
+  payDueDate: string | null;
+
   @Column("timestamp", {
     name: "createdAt",
     default: () => "CURRENT_TIMESTAMP",
