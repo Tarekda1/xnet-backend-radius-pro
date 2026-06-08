@@ -53,6 +53,10 @@ export class Raduserprofile {
   })
   quotaResetDay: number | null;
 
+  /** Optional manual anchor for the current monthly billing cycle (YYYY-MM-DD). */
+  @Column("date", { name: "quota_cycle_start_date", nullable: true })
+  quotaCycleStartDate: string | null;
+
   @Column("varchar", {
     name: "account_status",
     nullable: true,

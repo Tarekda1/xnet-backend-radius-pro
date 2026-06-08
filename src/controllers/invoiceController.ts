@@ -28,7 +28,7 @@ import { AppDataSource } from "../db/config";
 import { Invoices } from "../db/entities/Invoices";
 import { UserDetails } from "../db/entities/UserDetails";
 import { Raduserprofile } from "../db/entities/Raduserprofile";
-import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict } from "../services/whatsappService";
+import { composePaidMessage, sendWhatsAppMessage, sendWhatsAppMessageStrict, getWhatsAppConfigStatus, getTwilioCredentialDiagnostics, testTwilioCredentials, composeReminderMessage, buildReminderTemplateVariables, buildPaymentTemplateVariables } from "../services/whatsappService";
 
 const sendResponse = (res: Response, success: boolean, status: number, message: string, data: any = null) => {
   res.status(status).json({ success, message, data });
@@ -88,17 +88,15 @@ const computeDunningDates = (billingMonth: Date, graceDays: number, asOfDate?: D
   return { dueDate, overdueDays };
 };
 
-const buildReminderMessage = (invoice: DunningCandidate) => {
-  const month = invoice.billingMonth ? String(invoice.billingMonth).slice(0, 10) : "";
-  const amountValue = typeof invoice.amount === "number" ? invoice.amount.toFixed(2) : String(invoice.amount ?? "");
-  const name = invoice.fullName || invoice.username || "Customer";
-  return (
-    `Hi ${name}, this is a payment reminder for Invoice #${invoice.id}` +
-    (month ? ` (Billing month: ${month})` : "") +
-    (amountValue ? `, amount: $${amountValue}` : "") +
-    `. Status: ${invoice.status || "unpaid"}. Thank you.`
-  );
-};
+const buildReminderMessage = (invoice: DunningCandidate) =>
+  composeReminderMessage({
+    fullName: invoice.fullName,
+    username: invoice.username,
+    invoiceId: invoice.id,
+    amount: invoice.amount,
+    billingMonth: invoice.billingMonth,
+    status: invoice.status,
+  });
 
 const defaultDunningStages = (): DunningStage[] => {
   const secondReminderDay = Math.max(0, parseIntOrDefault(process.env.DUNNING_SECOND_REMINDER_DAY, 3));
@@ -178,16 +176,18 @@ const applyDunningAction = async (params: {
   try {
     if (params.stage.action === "remind") {
       if (!params.invoice.phoneNumber) return { ok: true, status: "skipped", reason: "Missing phone number" };
-      const amountValue = typeof params.invoice.amount === "number" ? params.invoice.amount.toFixed(2) : String(params.invoice.amount ?? "");
-      const name = params.invoice.fullName || params.invoice.username || "Customer";
       await sendWhatsAppMessageStrict({
         to: params.invoice.phoneNumber,
         message: buildReminderMessage(params.invoice),
-        templateVariables: {
-          "1": String(name),
-          "2": String(params.invoice.id),
-          "3": String(amountValue),
-        },
+        templateKind: "reminder",
+        templateVariables: buildReminderTemplateVariables({
+          fullName: params.invoice.fullName,
+          username: params.invoice.username,
+          invoiceId: params.invoice.id,
+          amount: params.invoice.amount,
+          billingMonth: params.invoice.billingMonth,
+          status: params.invoice.status,
+        }),
       });
     } else if (params.stage.action === "throttle") {
       const profileId = Number(params.throttleProfileId || 0);
@@ -433,16 +433,16 @@ export const payInvoiceHandler = async (req: Request, res: Response) => {
           amount: inv?.amount,
           invoiceId,
         });
-        const templateName = user?.fullName || user?.username || 'Customer';
-        const amountValue = typeof inv?.amount === 'number' ? inv?.amount.toFixed(2) : String(inv?.amount ?? '');
         await sendWhatsAppMessage({
           to: phone,
           message,
-          templateVariables: {
-            "1": templateName,
-            "2": String(invoiceId),
-            "3": amountValue,
-          }
+          templateKind: "payment",
+          templateVariables: buildPaymentTemplateVariables({
+            fullName: user?.fullName,
+            username: user?.username,
+            invoiceId,
+            amount: inv?.amount,
+          }),
         });
       } catch (err) {
         console.warn("Failed to send WhatsApp for internal invoice", err);
@@ -901,16 +901,16 @@ export const payExternalInvoiceHandler = async (req: Request, res: Response) => 
           amount: invoice.amount,
           invoiceId: invoice.id,
         });
-        const templateName = invoice.fullName || invoice.username || 'Customer';
-        const amountValue = typeof invoice.amount === 'number' ? invoice.amount.toFixed(2) : String(invoice.amount ?? '');
         await sendWhatsAppMessage({
           to: phone,
           message,
-          templateVariables: {
-            "1": templateName,
-            "2": String(invoice.id ?? ''),
-            "3": amountValue,
-          }
+          templateKind: "payment",
+          templateVariables: buildPaymentTemplateVariables({
+            fullName: invoice.fullName,
+            username: invoice.username,
+            invoiceId: invoice.id,
+            amount: invoice.amount,
+          }),
         });
       } catch (err) {
         console.warn("Failed to send WhatsApp for external invoice", err);
@@ -977,25 +977,27 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
       );
     }
 
-    const amountValue = typeof invoice.amount === "number" ? invoice.amount.toFixed(2) : String(invoice.amount ?? "");
-    const month = invoice.billingMonth ? String(invoice.billingMonth).slice(0, 10) : "";
-    const name = invoice.fullName || invoice.username || "Customer";
-
-    const message =
-      `Hi ${name}, this is a payment reminder for Invoice #${invoice.id}` +
-      (month ? ` (Billing month: ${month})` : "") +
-      (amountValue ? `, amount: $${amountValue}` : "") +
-      `. Status: ${invoice.status || "unpaid"}. Thank you.`;
+    const message = composeReminderMessage({
+      fullName: invoice.fullName,
+      username: invoice.username,
+      invoiceId: invoice.id,
+      amount: invoice.amount,
+      billingMonth: invoice.billingMonth,
+      status: invoice.status,
+    });
 
     const result = await sendWhatsAppMessageStrict({
       to: phone,
       message,
-      // Reuse the same 3 variables pattern used elsewhere (twilio/cloud templates)
-      templateVariables: {
-        "1": String(name),
-        "2": String(invoice.id ?? ""),
-        "3": String(amountValue),
-      },
+      templateKind: "reminder",
+      templateVariables: buildReminderTemplateVariables({
+        fullName: invoice.fullName,
+        username: invoice.username,
+        invoiceId: invoice.id,
+        amount: invoice.amount,
+        billingMonth: invoice.billingMonth,
+        status: invoice.status,
+      }),
     });
 
     // Optional: mark last action (best-effort; don't fail reminder if update fails)
@@ -1142,3 +1144,15 @@ export const updateExternalInvoiceHandler = async (req: Request, res: Response) 
   }
 };
 
+/** Masked Twilio/WhatsApp env diagnostics for troubleshooting (no full secrets). */
+export const getWhatsAppDiagnosticsHandler = async (_req: Request, res: Response) => {
+  try {
+    const config = getWhatsAppConfigStatus();
+    const twilio = getTwilioCredentialDiagnostics();
+    const authTest = config.enabled && config.provider === "twilio" ? await testTwilioCredentials() : null;
+    return sendResponse(res, true, 200, "WhatsApp diagnostics", { config, twilio, authTest });
+  } catch (error: any) {
+    console.error("Error fetching WhatsApp diagnostics:", error);
+    return sendResponse(res, false, 500, error?.message || "Failed to fetch WhatsApp diagnostics");
+  }
+};

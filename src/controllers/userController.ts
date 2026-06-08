@@ -22,6 +22,9 @@ import { SessionTracking } from '../db/entities/SessionTracking';
 import { Invoices } from '../db/entities/Invoices';
 import { Radacct } from '../db/entities/Radacct';
 import { Nas } from '../db/entities/Nas';
+import { parseDateOnlyField, sqlMonthlyCycleResetAt, sqlMonthlyCycleStart } from '../utils/quotaCycle';
+import { getQuotaUsageForUsers } from '../utils/quotaUsage';
+import { readOnlineSessionConfig, sqlRadacctIsOnline, sqlRadacctLastUpdate } from '../utils/onlineSessionPolicy';
 
 
 
@@ -29,9 +32,16 @@ const sendResponse = (res: Response, success: boolean, status: number, message: 
     res.status(status).json({ success, message, data });
 };
 
+async function isFallbackProfileId(profileId: number): Promise<boolean> {
+    if (!Number.isFinite(profileId) || profileId <= 0) return false;
+    const profile = await AppDataSource.getRepository(Radprofile).findOne({ where: { id: profileId } as any });
+    return String(profile?.profileName ?? "").trim().toLowerCase() === "fallback";
+}
+
 async function upsertUserDefaultProfileBestEffort(username: string, profileId: number): Promise<void> {
     try {
         if (!username || !Number.isFinite(profileId) || profileId <= 0) return;
+        if (await isFallbackProfileId(profileId)) return;
         await AppDataSource.query(
             `
             INSERT INTO user_default_profiles (username, default_profile_id)
@@ -50,6 +60,7 @@ async function upsertUserDefaultProfilesBulkBestEffort(usernames: string[], prof
     try {
         if (!Array.isArray(usernames) || usernames.length === 0) return;
         if (!Number.isFinite(profileId) || profileId <= 0) return;
+        if (await isFallbackProfileId(profileId)) return;
 
         // Keep query size reasonable
         const chunkSize = 200;
@@ -190,15 +201,13 @@ function formatUsersWithStatus(entities: any, raw: any) {
 
 async function getFreshUsersStatusMap(
     usernames: string[],
-    staleCutoff: Date
+    staleCutoff: Date,
+    activeCutoff: Date
 ): Promise<Record<string, { isOnline: boolean; lastTimeActive: any }>> {
     if (!Array.isArray(usernames) || usernames.length === 0) return {};
 
     const sessionRepo = AppDataSource.getRepository(SessionTracking);
 
-    // Match the same "online" definition used by the OnlineUsers endpoint:
-    // - SessionTracking is active
-    // - AND there exists an open radacct session with a recent update (>= staleCutoff)
     const rows = await sessionRepo
         .createQueryBuilder("st")
         .select("st.username", "username")
@@ -210,8 +219,8 @@ async function getFreshUsersStatusMap(
         .leftJoin(
             "radacct",
             "ra",
-            "ra.acctsessionid = st.session_id AND ra.acctstoptime IS NULL AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff",
-            { staleCutoff }
+            `ra.acctsessionid = st.session_id AND ${sqlRadacctIsOnline("ra")}`,
+            { staleCutoff, activeCutoff }
         )
         .where("st.status = 'active'")
         .andWhere("st.username IN (:...usernames)", { usernames })
@@ -241,9 +250,7 @@ async function getActiveRadiusSession(username: string): Promise<{
     nasIp: string;
     framedIp: string | null;
 } | null> {
-    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+    const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
     const row = await AppDataSource.getRepository(Radacct)
         .createQueryBuilder("ra")
@@ -253,69 +260,15 @@ async function getActiveRadiusSession(username: string): Promise<{
             "ra.framedipaddress AS framedIp",
         ])
         .where("ra.username = :username", { username })
-        .andWhere("ra.acctstoptime IS NULL")
-        .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
-        .orderBy("COALESCE(ra.acctupdatetime, ra.acctstarttime)", "DESC")
+        .andWhere(sqlRadacctIsOnline("ra"))
+        .orderBy(sqlRadacctLastUpdate("ra"), "DESC")
+        .setParameters({ staleCutoff, activeCutoff })
         .getRawOne<{ acctSessionId: string; nasIp: string; framedIp: string | null }>();
 
     if (!row?.acctSessionId || !row?.nasIp) return null;
     return { acctSessionId: row.acctSessionId, nasIp: row.nasIp, framedIp: row.framedIp ?? null };
 }
 
-function safeIntDayOfMonth(input: any): number {
-    const n = typeof input === "number" ? input : parseInt(String(input ?? ""), 10);
-    // keep within 1..31; mysql DATE_FORMAT(%Y-%m-) + day string expects 2 digits
-    if (!Number.isFinite(n)) return 1;
-    return Math.min(31, Math.max(1, Math.floor(n)));
-}
-
-function todayYyyyMmDd(): string {
-    // Works for MySQL DATE comparisons in this project (YYYY-MM-DD).
-    return new Date().toISOString().slice(0, 10);
-}
-
-function currentMonthResetStart(resetDay: number | null | undefined): string {
-    const d = safeIntDayOfMonth(resetDay ?? 1);
-    const now = new Date();
-    const yyyy = now.getFullYear();
-    const mm = String(now.getMonth() + 1).padStart(2, "0");
-    const dd = String(d).padStart(2, "0");
-    // NOTE: this intentionally matches the existing FreeRADIUS monthly window logic:
-    // DATE_FORMAT(NOW(), CONCAT('%Y-%m-', LPAD(quota_reset_day,2,'0')))
-    return `${yyyy}-${mm}-${dd}`;
-}
-
-async function getQuotaUsageForUsers(usernames: string[]): Promise<Record<string, { dailyUsage: bigint; monthlyUsage: bigint }>> {
-    if (!Array.isArray(usernames) || usernames.length === 0) return {};
-    const today = todayYyyyMmDd();
-
-    // Build a parameterized IN clause.
-    const placeholders = usernames.map(() => "?").join(",");
-    const sql = `
-      SELECT
-        up.username AS username,
-        COALESCE(SUM(CASE WHEN s.day = CURDATE() THEN s.data_usage ELSE 0 END), 0) AS daily_usage,
-        COALESCE(SUM(CASE
-          WHEN s.day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
-          THEN s.data_usage ELSE 0 END), 0) AS monthly_usage
-      FROM raduserprofile up
-      LEFT JOIN radusagestats s
-        ON s.username = up.username
-      WHERE up.username IN (${placeholders})
-      GROUP BY up.username
-    `;
-
-    // Note: we don't pass "today" because we use CURDATE() in SQL for consistency.
-    const rows = await AppDataSource.query(sql, usernames);
-    return (rows as any[]).reduce((acc, r) => {
-        const u = String(r?.username ?? "");
-        if (!u) return acc;
-        const daily = BigInt(String(r?.daily_usage ?? "0"));
-        const monthly = BigInt(String(r?.monthly_usage ?? "0"));
-        acc[u] = { dailyUsage: daily, monthlyUsage: monthly };
-        return acc;
-    }, {} as Record<string, { dailyUsage: bigint; monthlyUsage: bigint }>);
-}
 
 function parseBigIntSafe(v: any): bigint {
     try {
@@ -339,15 +292,28 @@ function withQuotaExceededFlags(users: any[]): Promise<any[]> {
         const usageMap = await getQuotaUsageForUsers(usernames);
         return users.map((u) => {
             const username = String(u?.username ?? "");
-            const usage = usageMap[username] ?? { dailyUsage: BigInt(0), monthlyUsage: BigInt(0) };
+            const usage = usageMap[username] ?? {
+                dailyUsage: BigInt(0),
+                monthlyUsage: BigInt(0),
+                monthlyCycleStart: null,
+                monthlyCycleResetAt: null,
+            };
             const dailyQuota = parseBigIntSafe(u?.profile?.dailyQuota);
             const monthlyQuota = parseBigIntSafe(u?.profile?.monthlyQuota);
             const isDailyExceeded = usage.dailyUsage > dailyQuota;
             const isMonthlyExceededComputed = usage.monthlyUsage > monthlyQuota;
+            const monthlyUsagePct =
+                monthlyQuota > BigInt(0)
+                    ? Math.min(100, Number((usage.monthlyUsage * BigInt(100)) / monthlyQuota))
+                    : 0;
             return {
                 ...u,
+                dailyUsage: usage.dailyUsage.toString(),
+                monthlyUsage: usage.monthlyUsage.toString(),
+                monthlyCycleStart: usage.monthlyCycleStart,
+                monthlyCycleResetAt: usage.monthlyCycleResetAt,
+                monthlyUsagePct,
                 isDailyExceeded,
-                // keep existing stored flag as-is, but provide computed too for reporting consistency
                 isMonthlyExceededComputed,
             };
         });
@@ -373,9 +339,7 @@ export const UserController = {
 
             // Keep "online" consistent with OnlineUsers:
             // treat sessions as online only if we saw a recent radacct update.
-            const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-            const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-            const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+            const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
             // 🔹 Check Redis cache for user data
             const cachedResponse = await redisClient.get(cacheKey);
@@ -386,7 +350,7 @@ export const UserController = {
                 const users = Array.isArray(userData?.users) ? userData.users : [];
                 const usernames = users.map((u: any) => u?.username).filter(Boolean);
 
-                const freshStatus = await getFreshUsersStatusMap(usernames, staleCutoff);
+                const freshStatus = await getFreshUsersStatusMap(usernames, staleCutoff, activeCutoff);
 
                 const enrichedUsers = await withQuotaExceededFlags(
                     users.map((user: any) => ({
@@ -451,8 +415,8 @@ export const UserController = {
                             .leftJoin(
                                 "radacct",
                                 "ra",
-                                "ra.acctsessionid = st.session_id AND ra.acctstoptime IS NULL AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff",
-                                { staleCutoff }
+                                `ra.acctsessionid = st.session_id AND ${sqlRadacctIsOnline("ra")}`,
+                                { staleCutoff, activeCutoff }
                             )
                             .groupBy("st.username"),
                     "activeSess",
@@ -478,6 +442,7 @@ export const UserController = {
                     "user.isFallback",
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
+                    "user.quotaCycleStartDate",
                     "user.accountStatus",
                     "user.expiresAt",
                     "user.expiryFramedIp",
@@ -505,7 +470,7 @@ export const UserController = {
                 .orderBy("user.id", "ASC")
                 .limit(limit)
                 .offset(offset)
-                .setParameters({ staleCutoff })
+                .setParameters({ staleCutoff, activeCutoff })
             
             if (isReseller) {
                 qb.andWhere("user.ownerResellerId = :rid", { rid: resellerId });
@@ -578,6 +543,7 @@ export const UserController = {
         body('expiryFramedIp').optional().isString(),
         body('freenight').optional().isBoolean(),
         body('quotaResetDay').isInt().optional(),
+        body('quotaCycleStartDate').optional(),
         body('fullName').optional().isString(),
         body('address').isString().optional(),
         body('phoneNumber').isString().optional(),
@@ -600,7 +566,7 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, accountStatus, freenight, quotaResetDay, fullName, address, phoneNumber, email, expiresAt, expiryFramedIp } = req.body;
+            const { username, password, profileId, accountStatus, freenight, quotaResetDay, quotaCycleStartDate, fullName, address, phoneNumber, email, expiresAt, expiryFramedIp } = req.body;
             try {
                 const { isReseller, resellerId } = getResellerFilter(req);
                 const userRepository = AppDataSource.getRepository(Raduserprofile);
@@ -629,6 +595,17 @@ export const UserController = {
                 user.isFallback = false;
                 user.isMonthlyExceeded = false;
                 user.quotaResetDay = quotaResetDay || new Date().getDate();
+                if (quotaCycleStartDate !== undefined) {
+                    if (quotaCycleStartDate === null || quotaCycleStartDate === "") {
+                        user.quotaCycleStartDate = null;
+                    } else {
+                        try {
+                            user.quotaCycleStartDate = parseDateOnlyField(quotaCycleStartDate)!.toISOString().slice(0, 10);
+                        } catch {
+                            return sendResponse(res, false, 400, "Invalid quotaCycleStartDate (use YYYY-MM-DD)");
+                        }
+                    }
+                }
                 user.accountStatus = (accountStatus || 'active') as any;
                 if (expiresAt !== undefined && expiresAt !== null && expiresAt !== "") {
                     try {
@@ -683,6 +660,8 @@ export const UserController = {
         body("expiresAt").optional(),
         body("expiryFramedIp").optional(),
         body('freenight').optional().isBoolean(), // Free-night toggle is optional
+        body('quotaResetDay').optional().isInt({ min: 1, max: 31 }),
+        body('quotaCycleStartDate').optional(),
         body('fullName').optional().isString(), // Full name is optional
         body('address').optional().isString(), // Address is optional
         body('phoneNumber').optional().isString(), // Phone number is optional
@@ -706,7 +685,7 @@ export const UserController = {
                 return sendResponse(res, false, 400, 'Validation errors', errors.array());
             }
 
-            const { username, password, profileId, accountStatus, freenight, fullName, address, phoneNumber, email, expiresAt, expiryFramedIp } = req.body;
+            const { username, password, profileId, accountStatus, freenight, quotaResetDay, quotaCycleStartDate, fullName, address, phoneNumber, email, expiresAt, expiryFramedIp } = req.body;
             // Optional: force disconnect so user re-auths (drops session).
             // This is NOT the default because CoA is usually sufficient and avoids disruptions.
             const forceDisconnect =
@@ -751,6 +730,24 @@ export const UserController = {
                 if (profileId) user.profileId = profileId;
                 if (accountStatus) user.accountStatus = accountStatus;
                 if (freenight !== undefined) user.freenight = Boolean(freenight);
+                if (quotaResetDay !== undefined && quotaResetDay !== null && quotaResetDay !== "") {
+                    const day = Number(quotaResetDay);
+                    if (!Number.isFinite(day) || day < 1 || day > 31) {
+                        return sendResponse(res, false, 400, "quotaResetDay must be 1..31");
+                    }
+                    user.quotaResetDay = day;
+                }
+                if (quotaCycleStartDate !== undefined) {
+                    if (quotaCycleStartDate === null || quotaCycleStartDate === "") {
+                        user.quotaCycleStartDate = null;
+                    } else {
+                        try {
+                            user.quotaCycleStartDate = parseDateOnlyField(quotaCycleStartDate)!.toISOString().slice(0, 10);
+                        } catch {
+                            return sendResponse(res, false, 400, "Invalid quotaCycleStartDate (use YYYY-MM-DD)");
+                        }
+                    }
+                }
                 if (expiresAt !== undefined) {
                     if (expiresAt === null || expiresAt === "") {
                         user.expiresAt = null;
@@ -1352,9 +1349,7 @@ export const UserController = {
 
             const userRepository = AppDataSource.getRepository(Raduserprofile);
 
-            const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-            const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-            const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+            const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
             const qb = userRepository
                 .createQueryBuilder("user")
@@ -1390,8 +1385,8 @@ export const UserController = {
                             .leftJoin(
                                 "radacct",
                                 "ra",
-                                "ra.acctsessionid = st.session_id AND ra.acctstoptime IS NULL AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff",
-                                { staleCutoff }
+                                `ra.acctsessionid = st.session_id AND ${sqlRadacctIsOnline("ra")}`,
+                                { staleCutoff, activeCutoff }
                             )
                             .groupBy("st.username"),
                     "activeSess",
@@ -1433,6 +1428,7 @@ export const UserController = {
                     "user.isFallback",
                     "user.isMonthlyExceeded",
                     "user.quotaResetDay",
+                    "user.quotaCycleStartDate",
                     "user.accountStatus",
                     "user.expiresAt",
                     "user.expiryFramedIp",
@@ -1451,7 +1447,7 @@ export const UserController = {
                     "userDetails.email",
                 ])
                 .orderBy("user.id", "ASC")
-                .setParameters({ staleCutoff })
+                .setParameters({ staleCutoff, activeCutoff })
                 .getRawAndEntities();
 
             const users = formatUsersWithStatus(entities, raw);
@@ -1496,6 +1492,7 @@ export const UserController = {
 
             // Fetch only users whose daily OR monthly usage exceeds their profile quotas.
             // We compute usage in SQL so we don't need to paginate across all users.
+            const cycleStart = sqlMonthlyCycleStart("up");
             const rows = await AppDataSource.query(
                 `
                 SELECT
@@ -1503,9 +1500,7 @@ export const UserController = {
                     ud.full_name AS fullName,
                     p.profile_name AS profileName,
                     COALESCE(SUM(CASE WHEN s.day = CURDATE() THEN s.data_usage ELSE 0 END), 0) AS dailyUsage,
-                    COALESCE(SUM(CASE
-                        WHEN s.day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
-                        THEN s.data_usage ELSE 0 END), 0) AS monthlyUsage,
+                    COALESCE(SUM(CASE WHEN s.day >= ${cycleStart} THEN s.data_usage ELSE 0 END), 0) AS monthlyUsage,
                     p.daily_quota AS dailyQuota,
                     p.monthly_quota AS monthlyQuota
                 FROM raduserprofile up
@@ -1522,8 +1517,11 @@ export const UserController = {
                     p.profile_name,
                     p.daily_quota,
                     p.monthly_quota,
-                    up.quota_reset_day
-                HAVING dailyUsage > dailyQuota OR monthlyUsage > monthlyQuota
+                    up.quota_reset_day,
+                    up.quota_cycle_start_date
+                HAVING
+                    (dailyQuota > 0 AND dailyUsage > dailyQuota)
+                    OR (monthlyQuota > 0 AND monthlyUsage > monthlyQuota)
                 ORDER BY up.username ASC;
                 `,
                 params
@@ -1536,12 +1534,18 @@ export const UserController = {
             });
 
             const monthlyAccounts = (rows as any[])
-                .filter((r) => parseBigIntSafe(r?.monthlyUsage) > parseBigIntSafe(r?.monthlyQuota))
+                .filter((r) => {
+                    const quota = parseBigIntSafe(r?.monthlyQuota);
+                    return quota > BigInt(0) && parseBigIntSafe(r?.monthlyUsage) > quota;
+                })
                 .map(toRow)
                 .filter((r) => r.username);
 
             const dailyAccounts = (rows as any[])
-                .filter((r) => parseBigIntSafe(r?.dailyUsage) > parseBigIntSafe(r?.dailyQuota))
+                .filter((r) => {
+                    const quota = parseBigIntSafe(r?.dailyQuota);
+                    return quota > BigInt(0) && parseBigIntSafe(r?.dailyUsage) > quota;
+                })
                 .map(toRow)
                 .filter((r) => r.username);
 
@@ -2134,18 +2138,6 @@ export const UserController = {
                             (user as any).ownerResellerId = resellerId;
                         }
                         await manager.save(Raduserprofile, user);
-                        try {
-                            await manager.query(
-                                `
-                                INSERT INTO user_default_profiles (username, default_profile_id)
-                                VALUES (?, ?)
-                                ON DUPLICATE KEY UPDATE default_profile_id = VALUES(default_profile_id);
-                                `,
-                                [u.username, u.profileId]
-                            );
-                        } catch (e: any) {
-                            console.warn("bulkCreateUsers: upsert user_default_profiles skipped:", e?.message || e);
-                        }
 
                         const userDetails = new UserDetails();
                         userDetails.username = u.username;
@@ -2155,6 +2147,8 @@ export const UserController = {
                         if (u.email !== undefined) userDetails.email = u.email || null;
                         await manager.save(UserDetails, userDetails);
                     });
+
+                    await upsertUserDefaultProfileBestEffort(u.username, u.profileId);
 
                     created += 1;
                     createdUsernames.push(u.username);

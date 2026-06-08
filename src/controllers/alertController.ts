@@ -279,14 +279,11 @@ export const deleteAlertRule = async (req: Request, res: Response) => {
 // Get all alerts
 export const getAlerts = async (req: Request, res: Response) => {
   try {
-    // TODO: Replace with actual database query
-    // const alerts = await getRepository(Alert).find({
-    //   order: { timestamp: 'DESC' }
-    // });
-    
+    // TODO: Replace with actual database query once Alert entity is wired up.
+    // Until then, return an empty list — mock alerts from 2024 were shown on every dashboard load.
     res.json({
       success: true,
-      data: mockAlerts
+      data: []
     });
   } catch (error) {
     console.error('Error fetching alerts:', error);

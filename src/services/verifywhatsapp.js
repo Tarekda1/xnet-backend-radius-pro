@@ -1,20 +1,28 @@
-const twilio = require("twilio"); // Or, for ESM: import twilio from "twilio";
+/**
+ * Manual Twilio WhatsApp smoke test.
+ * Usage (from repo root, with .env loaded):
+ *   node src/services/verifywhatsapp.js
+ *
+ * Requires: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID
+ */
+const twilio = require("twilio");
 
-// Find your Account SID and Auth Token at twilio.com/console
-// and set the environment variables. See http://twil.io/secure
-const accountSid = process.env.TWILIO_ACCOUNT_SID || "AC09e5a7c9b12d0ebd104552b30045b0e4";
-const authToken = process.env.TWILIO_AUTH_TOKEN || "6e9c964ab42ad7c3100a6c5a3eb0ce9d";
-const client = twilio(accountSid, authToken);
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
 
-async function createVerification() {
-  const verification = await client.verify.v2
-    .services("VA0e75c96dc31cd132955e8cfd2018f74e")
-    .verifications.create({
-      channel: "whatsapp",
-      to: "+9613974338",
-    });
-
-  console.log(verification);
+if (!accountSid || !authToken) {
+  console.error("Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN in .env");
+  process.exit(1);
 }
 
-createVerification();
+const client = twilio(accountSid, authToken);
+
+async function main() {
+  const account = await client.api.accounts(accountSid).fetch();
+  console.log("Twilio account OK:", account.status, account.friendlyName);
+}
+
+main().catch((err) => {
+  console.error("Twilio check failed:", err.message || err);
+  process.exit(1);
+});

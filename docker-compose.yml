@@ -9,21 +9,8 @@ services:
     env_file:
       - .env
     environment:
-      # WhatsApp sending (disabled by default; enable via .env)
-      WHATSAPP_ENABLED: ${WHATSAPP_ENABLED:-false}
-      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-cloud}
-      WHATSAPP_TEMPLATE_NAME: ${WHATSAPP_TEMPLATE_NAME:-payment_confirmation}
-      WHATSAPP_TEMPLATE_LANGUAGE_CODE: ${WHATSAPP_TEMPLATE_LANGUAGE_CODE:-en_US}
-
-      # Twilio (only used if WHATSAPP_PROVIDER=twilio)
-      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
-      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
-      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
-      TWILIO_MESSAGING_SERVICE_SID: ${TWILIO_MESSAGING_SERVICE_SID:-}
-      TWILIO_CONTENT_SID: ${TWILIO_CONTENT_SID:-}
-      TWILIO_CONTENT_VARIABLES_JSON: ${TWILIO_CONTENT_VARIABLES_JSON:-}
-      TWILIO_STATUS_CALLBACK_URL: ${TWILIO_STATUS_CALLBACK_URL:-}
-
+      # Non-secret service wiring only — Twilio/WhatsApp secrets stay in .env via env_file
+      # (avoid ${VAR:-} here; an empty host env can override env_file and wipe credentials)
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672}
       # Better logs for Loki (JSON + requestId fields)
       EXPIRY_DISCONNECT_CRON: ${EXPIRY_DISCONNECT_CRON:-*/5 * * * *}

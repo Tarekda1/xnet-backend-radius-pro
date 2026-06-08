@@ -9,6 +9,7 @@ import swaggerJsDoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
 import authRoutes from './routes/authRoutes';
 import { initializeDB } from './db/config';
+import { validateWhatsAppAtStartup } from './services/whatsappService';
 import radiusRoutes from './routes/radiusRoutes';
 import healthRoutes from './routes/healthRoutes';
 import { errorHandler } from './middleware/errorHandler';
@@ -322,7 +323,7 @@ app.use(errorHandler);
 startConsumer().catch((err) => console.error('Consumer error:', err));
 
 // Initialize database before starting server
-initializeDB().then(() => {
+initializeDB().then(async () => {
     // Start scheduled backup jobs (if env cron vars are set)
     startBackupScheduler(app);
     startConnectionLogsMaintenanceScheduler();
@@ -345,6 +346,8 @@ initializeDB().then(() => {
         runExpirySessionDisconnectJob().catch((e) => console.error("[expiry-disconnect] startup run failed", e));
       }, 5000);
     }
+
+    await validateWhatsAppAtStartup();
 
     server.listen(process.env.PORT || 3000, () => {
         console.log(`Server is running on http://localhost:${process.env.PORT || 3000}`);

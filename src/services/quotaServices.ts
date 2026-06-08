@@ -3,6 +3,7 @@ import { DataSource, QueryRunner } from 'typeorm';
 import { Raduserprofile } from '../db/entities/Raduserprofile';
 import { CacheService  } from './cacheService';
 import { EventBus } from '../bus/eventBus';
+import { sqlMonthlyCycleStart } from '../utils/quotaCycle';
 
 export class QuotaService {
   private dataSource: DataSource;
@@ -92,8 +93,7 @@ export class QuotaService {
     await queryRunner.startTransaction();
 
     try {
-      // Reset current "monthly window" usage as used by the backend/monthly calc:
-      // day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
+      const cycleStart = sqlMonthlyCycleStart("up");
       await queryRunner.query(
         `
         UPDATE radusagestats s
@@ -101,13 +101,11 @@ export class QuotaService {
           ON up.username = s.username
         SET s.data_usage = 0
         WHERE s.username = ?
-          AND s.day >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d');
+          AND s.day >= ${cycleStart};
         `,
         [username]
       );
 
-      // Best-effort reset of session tracking counters for this user's current window.
-      // (SessionTracking is an app table; accounting data is still kept in radacct.)
       await queryRunner.query(
         `
         UPDATE session_tracking st
@@ -121,9 +119,15 @@ export class QuotaService {
             st.session_time = 0,
             st.last_update = NOW()
         WHERE st.username = ?
-          AND DATE(st.start_time) >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d')
-          AND (DATE(st.end_time) >= STR_TO_DATE(CONCAT(DATE_FORMAT(CURDATE(), '%Y-%m-'), LPAD(up.quota_reset_day, 2, '0')), '%Y-%m-%d') OR st.end_time IS NULL);
+          AND DATE(st.start_time) >= ${cycleStart}
+          AND (DATE(st.end_time) >= ${cycleStart} OR st.end_time IS NULL);
         `,
+        [username]
+      );
+
+      // Anchor the new billing cycle from today after a manual monthly reset.
+      await queryRunner.query(
+        `UPDATE raduserprofile SET quota_cycle_start_date = CURDATE() WHERE username = ?;`,
         [username]
       );
 

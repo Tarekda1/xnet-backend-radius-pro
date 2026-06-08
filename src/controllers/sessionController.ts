@@ -12,6 +12,15 @@ import { ConnectionLogs } from "../db/entities/ConnectionLogs";
 import { Radacct } from "../db/entities/Radacct";
 import { Nas } from "../db/entities/Nas";
 import { UserController } from "./userController";
+import { sqlMonthlyCycleResetAt, sqlMonthlyCycleStart } from "../utils/quotaCycle";
+import { enrichOnlineUserRowsWithQuotaAsync } from "../utils/quotaUsage";
+import {
+  readOnlineSessionConfig,
+  sqlRadacctIsOnline,
+  sqlRadacctIsActive,
+  sqlRadacctLastUpdate,
+  sqlSessionStatusCase,
+} from "../utils/onlineSessionPolicy";
 
 export const healthCheck = (req: Request, res: Response) => {
   res.status(200).json({ status: 'UP' });
@@ -30,9 +39,7 @@ export const getLiveSessionDetail = async (req: Request, res: Response) => {
     const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
     const isReseller = role === "reseller" && !!resellerId;
 
-    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+    const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
     const repo = AppDataSource.getRepository(SessionTracking);
     const qb = repo
@@ -43,8 +50,8 @@ export const getLiveSessionDetail = async (req: Request, res: Response) => {
       .leftJoin(
         Radacct,
         "raLive",
-        "raLive.acctsessionid = session.session_id AND raLive.acctstoptime IS NULL AND COALESCE(raLive.acctupdatetime, raLive.acctstarttime) >= :staleCutoff",
-        { staleCutoff }
+        `raLive.acctsessionid = session.session_id AND ${sqlRadacctIsOnline("raLive")}`,
+        { staleCutoff, activeCutoff }
       )
       .select([
         "session.username AS username",
@@ -74,10 +81,9 @@ export const getLiveSessionDetail = async (req: Request, res: Response) => {
            SELECT 1
            FROM radacct ra
            WHERE ra.acctsessionid = session.session_id
-             AND ra.acctstoptime IS NULL
-             AND COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff
+             AND ${sqlRadacctIsOnline("ra")}
          )`,
-        { staleCutoff }
+        { staleCutoff, activeCutoff }
       );
 
     if (isReseller) {
@@ -159,9 +165,8 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
     const tomorrowStart = new Date(todayStart);
     tomorrowStart.setDate(tomorrowStart.getDate() + 1);
 
-    const firstDayOfMonth = new Date(today);
-    firstDayOfMonth.setDate(1);
-    const firstDayOfMonthStr = firstDayOfMonth.toISOString().split("T")[0]; // YYYY-MM-DD
+    const cycleStartSql = sqlMonthlyCycleStart("up2");
+    const cycleResetSql = sqlMonthlyCycleResetAt("up2");
 
     // 🔹 Get pagination parameters
     let page = parseInt(req.query.page as string) || 1;
@@ -173,12 +178,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
 
     const radacctRepo = AppDataSource.getRepository(Radacct);
 
-    // A session can be left "active" in DB if the NAS never sends Stop (power loss, crash, etc).
-    // Treat sessions as "online" only if we saw a recent update.
-    // For PPP AAA interim-update=1m, a 5m window is a safe default.
-    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+    const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
     // 🔹 Count total online users (source of truth: open + fresh radacct)
     const totalQb = radacctRepo
@@ -187,8 +187,8 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       .leftJoin(UserDetails, "userDetails", "ra.username = userDetails.username")
       .leftJoin(Nas, "nas", "nas.nasname = ra.nasipaddress")
       .select("COUNT(DISTINCT ra.username)", "cnt")
-      .where("ra.acctstoptime IS NULL")
-      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff });
+      .where(sqlRadacctIsOnline("ra"))
+      .setParameters({ staleCutoff, activeCutoff });
 
     if (search) {
       totalQb.andWhere(
@@ -209,13 +209,8 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
 
     const totalUsers = Number(totalUsersRow?.cnt ?? 0);
 
-    // A smaller window for "active" vs "idle" display. Still included as long as within staleCutoff.
-    const activeSecondsRaw = parseInt(process.env.ONLINE_SESSION_ACTIVE_SECONDS || "120", 10);
-    const activeSeconds = Number.isFinite(activeSecondsRaw) && activeSecondsRaw > 0 ? activeSecondsRaw : 120;
-    const activeCutoff = new Date(Date.now() - activeSeconds * 1000);
-
     // 🔹 Query online users with daily & monthly usage (base: radacct)
-    const users = await radacctRepo
+    const usersRaw = await radacctRepo
       .createQueryBuilder("ra")
       .leftJoin(SessionTracking, "st", "st.session_id = ra.acctsessionid AND st.username = ra.username")
       .leftJoinAndSelect(Radusagestats, "usage", "ra.username = usage.username AND usage.day = :today", { today })
@@ -236,14 +231,21 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         "dailyUsage",
         "ra.username = dailyUsage.du_username"
       )
-      .leftJoin(qb =>
-        qb.from(Radusagestats, "monthlyUsage")
-          .select([
-            "monthlyUsage.username AS monthly_username",
-            "SUM(monthlyUsage.data_usage) AS monthly_usage"
-          ])
-          .where("monthlyUsage.day BETWEEN :firstDayOfMonth AND :today", { firstDayOfMonth: firstDayOfMonthStr, today })
-          .groupBy("monthlyUsage.username"),
+      .leftJoin(
+        `(SELECT
+            up2.username AS monthly_username,
+            COALESCE(SUM(s.data_usage), 0) AS monthly_usage,
+            DATE_FORMAT(${cycleStartSql}, '%Y-%m-%d') AS monthly_cycle_start,
+            DATE_FORMAT(${cycleResetSql}, '%Y-%m-%d') AS monthly_cycle_reset_at,
+            up2.quota_reset_day AS quota_reset_day,
+            up2.quota_cycle_start_date AS quota_cycle_start_date,
+            COALESCE(up2.is_monthly_exceeded, 0) AS is_monthly_exceeded
+          FROM raduserprofile up2
+          LEFT JOIN radusagestats s
+            ON s.username = up2.username
+           AND s.day >= ${cycleStartSql}
+          GROUP BY up2.username, up2.quota_reset_day, up2.quota_cycle_start_date, up2.is_monthly_exceeded
+        )`,
         "monthlyUsage",
         "ra.username = monthlyUsage.monthly_username"
       )
@@ -262,15 +264,20 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         "COALESCE(ra.nasipaddress, '') AS session_nas_ip",
         "COALESCE(nas.shortname, nas.nasname, '') AS session_nas_name",
         "ra.acctstarttime AS session_start_time",
-        "COALESCE(ra.acctupdatetime, ra.acctstarttime) AS session_last_update",
+        `${sqlRadacctLastUpdate("ra")} AS session_last_update`,
         "ra.acctsessiontime AS session_session_time",
-        "CASE WHEN COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :activeCutoff THEN 'active' ELSE 'idle' END AS session_status",
+        `${sqlSessionStatusCase("ra")} AS session_status`,
         // Live counters from radacct (used by frontend to calculate real-time traffic rate)
         "COALESCE(ra.acctinputoctets, 0) AS total_bytes_in",
         "COALESCE(ra.acctoutputoctets, 0) AS total_bytes_out",
         "COALESCE(dailyUsage.daily_usage, 0) AS total_daily_usage",
         "COALESCE(usage.data_usage, 0) AS real_time_data_usage",
         "COALESCE(monthlyUsage.monthly_usage, 0) AS monthly_usage",
+        "monthlyUsage.monthly_cycle_start AS monthly_cycle_start",
+        "monthlyUsage.monthly_cycle_reset_at AS monthly_cycle_reset_at",
+        "monthlyUsage.quota_reset_day AS quota_reset_day",
+        "monthlyUsage.quota_cycle_start_date AS quota_cycle_start_date",
+        "monthlyUsage.is_monthly_exceeded AS is_monthly_exceeded",
         "profile.profileName AS profile_profile_name",
         "profile.dailyQuota AS profile_daily_quota",
         "profile.monthlyQuota AS profile_monthly_quota",
@@ -279,8 +286,7 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
         "GREATEST(profile.monthlyQuota - COALESCE(monthlyUsage.monthly_usage, 0), 0) AS remaining_monthly_quota",
         "userDetails.fullName AS userDetails_full_name",
       ])
-      .where("ra.acctstoptime IS NULL")
-      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
+      .where(sqlRadacctIsOnline("ra"))
       .andWhere(new Brackets(qb => {
         qb.where("LOWER(ra.username) LIKE :search", { search: `%${search}%` })
           .orWhere("LOWER(userDetails.fullName) LIKE :search", { search: `%${search}%` })
@@ -294,15 +300,19 @@ export const getOnlineUsersWithUsage = async (req: Request, res: Response) => {
       .groupBy(`ra.username, ra.acctsessionid, ra.callingstationid, ra.acctstarttime, ra.acctupdatetime, ra.acctsessiontime,
         st.mac_address,
         ra.acctinputoctets, ra.acctoutputoctets,
-        usage.data_usage, monthlyUsage.monthly_usage, dailyUsage.daily_usage,
+        usage.data_usage, monthlyUsage.monthly_usage, monthlyUsage.monthly_cycle_start, monthlyUsage.monthly_cycle_reset_at,
+        monthlyUsage.quota_reset_day, monthlyUsage.quota_cycle_start_date, monthlyUsage.is_monthly_exceeded,
+        dailyUsage.daily_usage,
         profile.profileName, profile.dailyQuota, profile.monthlyQuota, userProfile.is_fallback,
         ra.nasipaddress, nas.shortname, nas.nasname,
         userDetails.fullName`)
-      .orderBy("COALESCE(ra.acctupdatetime, ra.acctstarttime)", "DESC")
+      .orderBy(sqlRadacctLastUpdate("ra"), "DESC")
       .limit(limit)
       .offset(offset)
-      .setParameters({ todayStart, tomorrowStart, activeCutoff })
+      .setParameters({ todayStart, tomorrowStart, staleCutoff, activeCutoff })
       .getRawMany();
+
+    const users = await enrichOnlineUserRowsWithQuotaAsync(usersRaw);
 
     res.status(200).json({
       success: true,
@@ -325,9 +335,7 @@ export const getOnlineUsersMetrics = async (req: Request, res: Response) => {
   const resellerId = typeof resellerIdRaw === "number" && Number.isFinite(resellerIdRaw) ? resellerIdRaw : null;
   const isReseller = role === "reseller" && !!resellerId;
 
-  const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-  const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-  const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+  const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
   if (!isReseller) {
     const metrics = await getOnlineUsers();
@@ -339,23 +347,30 @@ export const getOnlineUsersMetrics = async (req: Request, res: Response) => {
     return;
   }
 
-  // Reseller-scoped metrics: count only reseller-owned users with open+fresh radacct
+  // Reseller-scoped metrics: count only reseller-owned users with open radacct
   const raRepo = AppDataSource.getRepository(Radacct);
-  const row = await raRepo
+  const onlineRow = await raRepo
     .createQueryBuilder("ra")
     .innerJoin(Raduserprofile, "u", "u.username = ra.username AND u.owner_reseller_id = :rid", { rid: resellerId })
-    .select("COUNT(DISTINCT ra.username)", "totalOnlineUsers")
-    .addSelect("COUNT(DISTINCT ra.username)", "totalActiveUsers")
-    .where("ra.acctstoptime IS NULL")
-    .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
-    .getRawOne<{ totalOnlineUsers: string; totalActiveUsers: string }>();
+    .select("COUNT(DISTINCT ra.username)", "cnt")
+    .where(sqlRadacctIsOnline("ra"))
+    .setParameters({ staleCutoff, activeCutoff })
+    .getRawOne<{ cnt: string }>();
+
+  const activeRow = await raRepo
+    .createQueryBuilder("ra")
+    .innerJoin(Raduserprofile, "u", "u.username = ra.username AND u.owner_reseller_id = :rid", { rid: resellerId })
+    .select("COUNT(DISTINCT ra.username)", "cnt")
+    .where(sqlRadacctIsActive("ra"))
+    .setParameters({ staleCutoff, activeCutoff })
+    .getRawOne<{ cnt: string }>();
 
   res.status(200).json({
     success: true,
     message: "Online users fetched successfully",
     data: {
-      totalOnlineUsers: Number(row?.totalOnlineUsers ?? 0),
-      totalActiveUsers: Number(row?.totalActiveUsers ?? 0),
+      totalOnlineUsers: Number(onlineRow?.cnt ?? 0),
+      totalActiveUsers: Number(activeRow?.cnt ?? 0),
     },
   });
 };
@@ -664,9 +679,7 @@ export const getNocSnapshot = async (req: Request, res: Response) => {
       };
     });
 
-    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+    const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
     const nasQb = AppDataSource.getRepository(Radacct)
       .createQueryBuilder("ra")
@@ -674,8 +687,8 @@ export const getNocSnapshot = async (req: Request, res: Response) => {
       .select("COALESCE(ra.nasipaddress, 'Unknown')", "nasIp")
       .addSelect("COALESCE(n.shortname, n.nasname, ra.nasipaddress, 'Unknown')", "nasLabel")
       .addSelect("COUNT(*)", "sessions")
-      .where("ra.acctstoptime IS NULL")
-      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff });
+      .where(sqlRadacctIsOnline("ra"))
+      .setParameters({ staleCutoff, activeCutoff });
 
     if (isReseller) {
       nasQb.innerJoin(
@@ -719,15 +732,13 @@ export const getNocHealth = async (req: Request, res: Response) => {
     await AppDataSource.query("SELECT 1");
     const dbLatencyMs = Math.max(0, Date.now() - dbStart);
 
-    const staleSecondsRaw = parseInt(process.env.ONLINE_SESSION_STALE_SECONDS || "300", 10);
-    const staleSeconds = Number.isFinite(staleSecondsRaw) && staleSecondsRaw > 0 ? staleSecondsRaw : 300;
-    const staleCutoff = new Date(Date.now() - staleSeconds * 1000);
+    const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
 
     const activeSessionsRow = await AppDataSource.getRepository(Radacct)
       .createQueryBuilder("ra")
       .select("COUNT(*)", "cnt")
-      .where("ra.acctstoptime IS NULL")
-      .andWhere("COALESCE(ra.acctupdatetime, ra.acctstarttime) >= :staleCutoff", { staleCutoff })
+      .where(sqlRadacctIsOnline("ra"))
+      .setParameters({ staleCutoff, activeCutoff })
       .getRawOne<{ cnt: string }>();
 
     const activeSessions = Number(activeSessionsRow?.cnt ?? 0);

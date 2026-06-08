@@ -90,6 +90,23 @@ export const AppDataSource = new DataSource({
     subscribers: [SessionTrackingSubscriber]
 });
 
+async function ensureQuotaCycleStartDateColumn(): Promise<void> {
+    const rows = (await AppDataSource.query(
+        `SELECT COUNT(*) AS cnt
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'raduserprofile'
+           AND COLUMN_NAME = 'quota_cycle_start_date'`
+    )) as Array<{ cnt: string | number }>;
+    if (Number(rows?.[0]?.cnt ?? 0) > 0) return;
+    await AppDataSource.query(
+        `ALTER TABLE raduserprofile
+           ADD COLUMN quota_cycle_start_date DATE NULL DEFAULT NULL
+           AFTER quota_reset_day`
+    );
+    console.log("✅ Added raduserprofile.quota_cycle_start_date");
+}
+
 export const initializeDB = async () => {
     try {
         // Debug: Log entities being loaded
@@ -100,6 +117,12 @@ export const initializeDB = async () => {
         await AppDataSource.initialize();
         console.log("✅ Database connection established");
         console.log("✅ Entities loaded:", AppDataSource.entityMetadatas.map(e => e.name));
+
+        try {
+            await ensureQuotaCycleStartDateColumn();
+        } catch (patchError: any) {
+            console.warn("⚠️ quota_cycle_start_date schema patch skipped:", patchError?.message || patchError);
+        }
     } catch (error: any) {
         console.error("❌ Error connecting to database:", error);
         console.error("❌ Error details:", error.message);
