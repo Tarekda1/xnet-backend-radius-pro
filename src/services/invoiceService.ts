@@ -730,6 +730,39 @@ export const getExternalInvoicesAgingSummary = async (params: {
     };
 };
 
+/** Monthly billing trend for the external invoices dashboard (last N billing months). */
+export const getExternalInvoicesMonthlyTrend = async (months = 6) => {
+    const safeMonths = Math.min(24, Math.max(1, Number(months) || 6));
+    const repo = AppDataSource.getRepository(ExternalInvoice);
+
+    const rows = (await repo
+        .createQueryBuilder('e')
+        .select("DATE_FORMAT(e.billingMonth, '%Y-%m')", 'month')
+        .addSelect('COUNT(*)', 'totalCount')
+        .addSelect("SUM(CASE WHEN e.status = 'paid' THEN 1 ELSE 0 END)", 'paidCount')
+        .addSelect('COALESCE(SUM(e.amount), 0)', 'totalAmount')
+        .addSelect("COALESCE(SUM(CASE WHEN e.status = 'paid' THEN e.amount ELSE 0 END), 0)", 'paidAmount')
+        .where('e.deletedAt IS NULL')
+        .andWhere('e.billingMonth >= DATE_SUB(CURDATE(), INTERVAL :months MONTH)', { months: safeMonths })
+        .groupBy("DATE_FORMAT(e.billingMonth, '%Y-%m')")
+        .orderBy('month', 'ASC')
+        .getRawMany()) as Array<{
+            month: string;
+            totalCount: string;
+            paidCount: string;
+            totalAmount: string;
+            paidAmount: string;
+        }>;
+
+    return rows.map((row) => ({
+        month: row.month,
+        totalCount: Number(row.totalCount || 0),
+        paidCount: Number(row.paidCount || 0),
+        totalAmount: Number(row.totalAmount || 0),
+        paidAmount: Number(row.paidAmount || 0),
+    }));
+};
+
 /** Open external invoices that have a payment target date set (for tracker + reminders). */
 export const getExternalInvoicesPaymentDueTracker = async (): Promise<ExternalInvoice[]> => {
     const repo = AppDataSource.getRepository(ExternalInvoice);

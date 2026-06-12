@@ -9,6 +9,7 @@ const router = Router();
 // accidentally protect ALL /api/* routes (including /api/invoices/*).
 router.use('/profiles', authenticateToken, authorizePermissions('radius.profiles.view'));
 router.get('/profiles', ProfileController.getProfiles);
+router.get('/profiles/usage', ProfileController.getProfilesUsage);
 router.get('/profiles/:id', ProfileController.getProfile);
 router.post('/profiles', ProfileController.createProfile);
 router.put('/profiles/:id', ProfileController.updateProfile);

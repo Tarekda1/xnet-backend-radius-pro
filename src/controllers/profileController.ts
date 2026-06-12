@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { AppDataSource } from '../db/config';
 import { Radprofile } from '../db/entities/Radprofile';
+import { Raduserprofile } from '../db/entities/Raduserprofile';
 import { body, validationResult } from 'express-validator';
 import { redisClient } from "../redisClient";
 
@@ -23,6 +24,32 @@ export const ProfileController = {
         } catch (error) {
             console.error(error);
             sendResponse(res, false, 500, 'Error fetching profiles');
+        }
+    },
+
+    /** Per-profile usage: how many users are assigned to each profile (and how many of them are active). */
+    getProfilesUsage: async (req: Request, res: Response) => {
+        try {
+            const rows = (await AppDataSource.getRepository(Raduserprofile)
+                .createQueryBuilder("up")
+                .select("up.profileId", "profileId")
+                .addSelect("COUNT(*)", "usersCount")
+                .addSelect(
+                    "SUM(CASE WHEN LOWER(COALESCE(up.accountStatus, '')) = 'active' THEN 1 ELSE 0 END)",
+                    "activeCount"
+                )
+                .groupBy("up.profileId")
+                .getRawMany()) as Array<{ profileId: number; usersCount: string; activeCount: string }>;
+
+            const usage = rows.map((r) => ({
+                profileId: Number(r.profileId),
+                usersCount: Number(r.usersCount || 0),
+                activeCount: Number(r.activeCount || 0),
+            }));
+            sendResponse(res, true, 200, 'Profile usage fetched successfully', usage);
+        } catch (error) {
+            console.error(error);
+            sendResponse(res, false, 500, 'Error fetching profile usage');
         }
     },
 
@@ -139,6 +166,21 @@ export const ProfileController = {
             if (!profile) {
                 return sendResponse(res, false, 404, 'Profile not found');
             }
+
+            // Refuse to delete a profile that still has users assigned — deleting it
+            // would orphan their RADIUS configuration.
+            const assignedUsers = await AppDataSource.getRepository(Raduserprofile).count({
+                where: { profileId: parsedId } as any,
+            });
+            if (assignedUsers > 0) {
+                return sendResponse(
+                    res,
+                    false,
+                    409,
+                    `Profile "${profile.profileName}" still has ${assignedUsers} assigned user(s). Reassign them before deleting.`
+                );
+            }
+
             await profileRepository.remove(profile);
             await redisClient.del('profiles'); // Invalidate cache
             await redisClient.del(`profile:${id}`); // Invalidate individual profile cache

@@ -70,6 +70,10 @@ export class ExternalInvoice {
   @Column("varchar", { name: "lastAction", nullable: true, length: 255 })
   lastAction: string | null;
 
+  /** Last time a WhatsApp payment reminder was sent (single, bulk, or dunning). */
+  @Column("timestamp", { name: "lastRemindedAt", nullable: true })
+  lastRemindedAt?: Date | null;
+
   @Column("varchar", { name: "provider", length: 10 })
   provider: string;
 

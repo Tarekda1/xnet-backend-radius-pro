@@ -9,6 +9,7 @@ router.use(authenticateToken);
 
 // Read access (view)
 router.get('/users/search', authorizeAnyPermissions('users.view', 'reseller.users.view'), UserController.searchUsers);
+router.get('/users/metrics', authorizeAnyPermissions('users.view', 'reseller.users.view'), UserController.getUsersMetrics);
 router.get('/users/quota-exceeded', authorizeAnyPermissions('users.view', 'reseller.users.view'), UserController.getQuotaExceededUsers);
 router.get('/users/:id', authorizeAnyPermissions('users.view', 'reseller.users.view'), UserController.getRadUser);
 router.get('/users', authorizeAnyPermissions('users.view', 'reseller.users.view'), UserController.getRadUsers);

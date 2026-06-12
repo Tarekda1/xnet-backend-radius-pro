@@ -1472,6 +1472,96 @@ export const UserController = {
         }
     },
 
+    /**
+     * Fleet-wide user metrics for the Users dashboard.
+     * Unlike the paginated list, these counts cover ALL users (scoped to the
+     * reseller when applicable), so KPI cards aren't limited to the current page.
+     */
+    getUsersMetrics: async (req: Request, res: Response) => {
+        try {
+            const { isReseller, resellerId } = getResellerFilter(req);
+            const { staleCutoff, activeCutoff } = readOnlineSessionConfig();
+            const userRepo = AppDataSource.getRepository(Raduserprofile);
+
+            const scopedQb = () => {
+                const qb = userRepo.createQueryBuilder("up");
+                if (isReseller) qb.andWhere("up.ownerResellerId = :rid", { rid: resellerId });
+                return qb;
+            };
+
+            const total = await scopedQb().getCount();
+
+            const statusRows = (await scopedQb()
+                .select("LOWER(COALESCE(NULLIF(TRIM(up.accountStatus), ''), 'unknown'))", "status")
+                .addSelect("COUNT(*)", "cnt")
+                .groupBy("status")
+                .getRawMany()) as Array<{ status: string; cnt: string }>;
+            const byStatus: Record<string, number> = {};
+            for (const row of statusRows) {
+                // Legacy rows use "disabled" where the UI says "inactive".
+                const key = row.status === "disabled" ? "inactive" : row.status;
+                byStatus[key] = (byStatus[key] ?? 0) + Number(row.cnt || 0);
+            }
+
+            const monthlyExceeded = await scopedQb()
+                .andWhere("up.isMonthlyExceeded = 1")
+                .getCount();
+
+            const onlineQb = AppDataSource.getRepository(Radacct)
+                .createQueryBuilder("ra")
+                .select("COUNT(DISTINCT ra.username)", "cnt")
+                .where(sqlRadacctIsOnline("ra"))
+                .setParameters({ staleCutoff, activeCutoff });
+            if (isReseller) {
+                onlineQb
+                    .innerJoin(Raduserprofile, "up", "up.username = ra.username")
+                    .andWhere("up.ownerResellerId = :rid", { rid: resellerId });
+            }
+            const onlineRow = await onlineQb.getRawOne<{ cnt: string }>();
+            const online = Number(onlineRow?.cnt ?? 0);
+
+            // Trend: distinct users with accounting activity per day (last 14 days).
+            const onlineDailyParams: any[] = isReseller ? [resellerId] : [];
+            const onlineDaily = (await AppDataSource.query(
+                `SELECT DATE(ra.acctstarttime) AS day, COUNT(DISTINCT ra.username) AS cnt
+                 FROM radacct ra
+                 ${isReseller ? "INNER JOIN raduserprofile up ON up.username = ra.username AND up.owner_reseller_id = ?" : ""}
+                 WHERE ra.acctstarttime >= DATE_SUB(CURDATE(), INTERVAL 14 DAY)
+                 GROUP BY DATE(ra.acctstarttime)
+                 ORDER BY day ASC;`,
+                onlineDailyParams
+            )) as Array<{ day: string; cnt: string }>;
+
+            // Trend: new users per week from audit logs (best effort; logs may be pruned).
+            let newUsersWeekly: Array<{ week: string; cnt: string }> = [];
+            try {
+                newUsersWeekly = (await AppDataSource.query(
+                    `SELECT DATE_FORMAT(l.timestamp, '%x-W%v') AS week,
+                            SUM(GREATEST(COALESCE(JSON_LENGTH(JSON_EXTRACT(l.meta, '$.targets')), 1), 1)) AS cnt
+                     FROM logs l
+                     WHERE l.message IN ('audit.users.create', 'audit.users.bulk.create')
+                       AND l.timestamp >= DATE_SUB(CURDATE(), INTERVAL 8 WEEK)
+                     GROUP BY week
+                     ORDER BY week ASC;`
+                )) as Array<{ week: string; cnt: string }>;
+            } catch {}
+
+            return sendResponse(res, true, 200, "User metrics fetched successfully", {
+                total,
+                online,
+                monthlyExceeded,
+                byStatus,
+                trends: {
+                    onlineDaily: onlineDaily.map((r) => ({ day: String(r.day).slice(0, 10), count: Number(r.cnt || 0) })),
+                    newUsersWeekly: newUsersWeekly.map((r) => ({ week: r.week, count: Number(r.cnt || 0) })),
+                },
+            });
+        } catch (error) {
+            console.error("Error fetching user metrics:", error);
+            return sendResponse(res, false, 500, "Error fetching user metrics");
+        }
+    },
+
     getQuotaExceededUsers: async (req: Request, res: Response) => {
         try {
             const { isReseller, resellerId } = getResellerFilter(req);

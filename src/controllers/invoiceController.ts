@@ -18,6 +18,7 @@ import {
   getExternalInvoiceHistory,
   setExternalInvoiceWorkflow,
   getExternalInvoicesPaymentDueTracker,
+  getExternalInvoicesMonthlyTrend,
 } from "../services/invoiceService";
 import * as XLSX from "xlsx";
 import fs from "fs";
@@ -213,6 +214,7 @@ const applyDunningAction = async (params: {
       { id: params.invoice.id },
       {
         lastAction: `${stageKey(params.stage)} by ${params.actor} @ ${new Date().toISOString()}`,
+        ...(params.stage.action === "remind" ? { lastRemindedAt: new Date() } : {}),
       }
     );
     return { ok: true, status: "sent" };
@@ -807,6 +809,17 @@ export const getExternalInvoicesAgingSummaryHandler = async (req: Request, res: 
   }
 };
 
+export const getExternalInvoicesTrendHandler = async (req: Request, res: Response) => {
+  try {
+    const months = Math.min(24, Math.max(1, parseIntOrDefault(req.query.months, 6)));
+    const result = await getExternalInvoicesMonthlyTrend(months);
+    sendResponse(res, true, 200, "External invoice trend fetched", result);
+  } catch (err) {
+    console.error("Error fetching external invoice trend:", err);
+    res.status(500).json({ message: "Failed to fetch invoice trend" });
+  }
+};
+
 export const getExternalInvoicesPaymentDueHandler = async (req: Request, res: Response) => {
   try {
     const rows = await getExternalInvoicesPaymentDueTracker();
@@ -1002,7 +1015,13 @@ export const remindExternalInvoiceHandler = async (req: Request, res: Response) 
 
     // Optional: mark last action (best-effort; don't fail reminder if update fails)
     try {
-      await repo.update({ id: invoiceId }, { lastAction: `reminded by ${req.user?.username || "system"} @ ${new Date().toISOString()}` });
+      await repo.update(
+        { id: invoiceId },
+        {
+          lastAction: `reminded by ${req.user?.username || "system"} @ ${new Date().toISOString()}`,
+          lastRemindedAt: new Date(),
+        }
+      );
     } catch {}
     try {
       await invoiceEvents.emitModification({
